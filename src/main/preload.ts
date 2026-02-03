@@ -133,6 +133,11 @@ contextBridge.exposeInMainWorld('pocketAgent', {
     ipcRenderer.on('navigate-tab', listener);
     return () => ipcRenderer.removeListener('navigate-tab', listener);
   },
+
+  // Voice
+  isVoiceAvailable: () => ipcRenderer.invoke('voice:available'),
+  transcribeAudio: (audioData: ArrayBuffer, format: string) =>
+    ipcRenderer.invoke('voice:transcribe', audioData, format),
 });
 
 // Session type
@@ -271,6 +276,9 @@ declare global {
       detectInstalledBrowsers: () => Promise<Array<{ id: string; name: string; path: string; processName: string; installed: boolean }>>;
       launchBrowser: (browserId: string, port?: number) => Promise<{ success: boolean; error?: string; alreadyRunning?: boolean }>;
       testBrowserConnection: (cdpUrl?: string) => Promise<{ connected: boolean; error?: string; browserInfo?: unknown }>;
+      // Voice
+      isVoiceAvailable: () => Promise<boolean>;
+      transcribeAudio: (audioData: ArrayBuffer, format: string) => Promise<{ success: boolean; text?: string; error?: string }>;
     };
   }
 }

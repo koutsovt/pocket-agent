@@ -11,6 +11,7 @@ import { loadIdentity, saveIdentity, getIdentityPath } from '../config/identity'
 import { loadInstructions, saveInstructions, getInstructionsPath } from '../config/instructions';
 import { closeTaskDb } from '../tools';
 import { initializeUpdater, setupUpdaterIPC, setSettingsWindow } from './updater';
+import { transcribeAudio, isTranscriptionAvailable } from '../utils/transcribe';
 import cityTimezones from 'city-timezones';
 
 // Handle EPIPE errors gracefully (happens when stdout pipe is closed)
@@ -1142,6 +1143,16 @@ function setupIPC(): void {
   ipcMain.handle('agent:stop', async (_, sessionId?: string) => {
     const stopped = AgentManager.stopQuery(sessionId);
     return { success: stopped };
+  });
+
+  // Voice
+  ipcMain.handle('voice:available', () => {
+    return isTranscriptionAvailable();
+  });
+
+  ipcMain.handle('voice:transcribe', async (_, audioData: ArrayBuffer, format: string) => {
+    const buffer = Buffer.from(audioData);
+    return transcribeAudio(buffer, format);
   });
 
   // Facts

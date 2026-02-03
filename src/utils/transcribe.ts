@@ -1,9 +1,14 @@
 /**
- * Audio transcription utility using OpenAI Whisper API
+ * Audio transcription utility using local Whisper CLI
  */
 
-import OpenAI from 'openai';
-import { SettingsManager } from '../settings';
+import { execFile, execSync } from 'child_process';
+import { promisify } from 'util';
+import * as fs from 'fs';
+import * as path from 'path';
+import * as os from 'os';
+
+const execFileAsync = promisify(execFile);
 
 export interface TranscriptionResult {
   success: boolean;
@@ -13,99 +18,162 @@ export interface TranscriptionResult {
 }
 
 /**
- * Transcribe audio buffer using OpenAI Whisper API
+ * Transcribe audio buffer using local Whisper CLI
  */
 export async function transcribeAudio(
   buffer: Buffer,
   format: string,
   language?: string
 ): Promise<TranscriptionResult> {
-  const apiKey = SettingsManager.get('openai.apiKey');
-
-  if (!apiKey) {
+  // Check if whisper is available
+  const whisperPath = findWhisperBinary();
+  if (!whisperPath) {
     return {
       success: false,
-      error: 'OpenAI API key not configured. Add your OpenAI key in Settings to enable voice notes.',
+      error: 'Local Whisper CLI not installed. Run: pip install openai-whisper',
     };
   }
 
-  try {
-    const openai = new OpenAI({ apiKey });
+  const tmpDir = os.tmpdir();
+  const tmpAudioPath = path.join(tmpDir, `whisper-input-${Date.now()}.${format}`);
+  const tmpOutputDir = path.join(tmpDir, `whisper-output-${Date.now()}`);
 
-    // Create a File object from the buffer
-    // OpenAI accepts: mp3, mp4, mpeg, mpga, m4a, wav, webm, ogg
-    const mimeType = getMimeType(format);
-    // Convert Buffer to ArrayBuffer for web API compatibility
-    const arrayBuffer = buffer.buffer.slice(buffer.byteOffset, buffer.byteOffset + buffer.byteLength) as ArrayBuffer;
-    const file = new File([arrayBuffer], `audio.${format}`, { type: mimeType });
+  try {
+    // Write audio buffer to temp file
+    await fs.promises.writeFile(tmpAudioPath, buffer);
+    await fs.promises.mkdir(tmpOutputDir, { recursive: true });
 
     const startTime = Date.now();
 
-    const response = await openai.audio.transcriptions.create({
-      file,
-      model: 'whisper-1',
-      language, // Optional: helps with accuracy if language is known
+    // Build whisper command args
+    const args = [
+      tmpAudioPath,
+      '--model', 'base', // Use base model for speed (can be changed to small/medium/large)
+      '--output_dir', tmpOutputDir,
+      '--output_format', 'txt',
+    ];
+
+    if (language) {
+      args.push('--language', language);
+    }
+
+    // Run whisper
+    await execFileAsync(whisperPath, args, {
+      timeout: 120000, // 2 minute timeout
     });
 
     const duration = (Date.now() - startTime) / 1000;
 
+    // Read the output text file
+    const baseName = path.basename(tmpAudioPath, `.${format}`);
+    const outputPath = path.join(tmpOutputDir, `${baseName}.txt`);
+
+    if (!fs.existsSync(outputPath)) {
+      return {
+        success: false,
+        error: 'Whisper did not produce output file',
+      };
+    }
+
+    const text = (await fs.promises.readFile(outputPath, 'utf-8')).trim();
+
+    // Cleanup
+    await cleanup(tmpAudioPath, tmpOutputDir);
+
     return {
       success: true,
-      text: response.text,
+      text,
       duration,
     };
   } catch (error) {
+    // Cleanup on error
+    await cleanup(tmpAudioPath, tmpOutputDir);
+
     console.error('[Transcribe] Error:', error);
 
-    // Handle specific OpenAI errors
-    if (error instanceof OpenAI.APIError) {
-      if (error.status === 401) {
+    if (error instanceof Error) {
+      if (error.message.includes('ENOENT')) {
         return {
           success: false,
-          error: 'Invalid OpenAI API key. Please check your key in Settings.',
+          error: 'Whisper binary not found. Install with: pip install openai-whisper',
         };
       }
-      if (error.status === 429) {
+      if (error.message.includes('ETIMEDOUT') || error.message.includes('timeout')) {
         return {
           success: false,
-          error: 'OpenAI rate limit exceeded. Please try again in a moment.',
+          error: 'Transcription timed out. Try a shorter audio clip.',
         };
       }
       return {
         success: false,
-        error: `OpenAI API error: ${error.message}`,
+        error: `Transcription failed: ${error.message}`,
       };
     }
 
     return {
       success: false,
-      error: error instanceof Error ? error.message : 'Unknown transcription error',
+      error: 'Unknown transcription error',
     };
   }
 }
 
 /**
- * Check if voice transcription is available (OpenAI key configured)
+ * Find the whisper binary path
  */
-export function isTranscriptionAvailable(): boolean {
-  return !!SettingsManager.get('openai.apiKey');
+function findWhisperBinary(): string | null {
+  try {
+    const result = execSync('which whisper', { encoding: 'utf-8' }).trim();
+    if (result && fs.existsSync(result)) {
+      return result;
+    }
+  } catch {
+    // Not found in PATH
+  }
+
+  // Check common locations
+  const commonPaths = [
+    '/opt/homebrew/bin/whisper',
+    '/usr/local/bin/whisper',
+    path.join(os.homedir(), '.local/bin/whisper'),
+  ];
+
+  for (const p of commonPaths) {
+    if (fs.existsSync(p)) {
+      return p;
+    }
+  }
+
+  return null;
 }
 
 /**
- * Get MIME type for audio format
+ * Check if voice transcription is available (local whisper installed)
  */
-function getMimeType(format: string): string {
-  const mimeTypes: Record<string, string> = {
-    ogg: 'audio/ogg',
-    oga: 'audio/ogg',
-    opus: 'audio/ogg',
-    mp3: 'audio/mpeg',
-    m4a: 'audio/mp4',
-    mp4: 'audio/mp4',
-    wav: 'audio/wav',
-    webm: 'audio/webm',
-    mpeg: 'audio/mpeg',
-    mpga: 'audio/mpeg',
-  };
-  return mimeTypes[format.toLowerCase()] || 'audio/ogg';
+export function isTranscriptionAvailable(): boolean {
+  try {
+    execSync('which whisper', { encoding: 'utf-8' });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Cleanup temporary files
+ */
+async function cleanup(audioPath: string, outputDir: string): Promise<void> {
+  try {
+    if (fs.existsSync(audioPath)) {
+      await fs.promises.unlink(audioPath);
+    }
+    if (fs.existsSync(outputDir)) {
+      const files = await fs.promises.readdir(outputDir);
+      for (const file of files) {
+        await fs.promises.unlink(path.join(outputDir, file));
+      }
+      await fs.promises.rmdir(outputDir);
+    }
+  } catch {
+    // Ignore cleanup errors
+  }
 }

@@ -1264,6 +1264,60 @@
       height: 18px;
     }
 
+    .mic-btn {
+      width: 36px;
+      height: 36px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      background: transparent;
+      border: none;
+      border-radius: var(--radius-sm);
+      cursor: pointer;
+      color: var(--text-muted);
+      transition: all 0.2s cubic-bezier(0.34, 1.56, 0.64, 1);
+      flex-shrink: 0;
+    }
+
+    .mic-btn:hover {
+      background: var(--border);
+      color: var(--accent);
+      transform: scale(1.1);
+    }
+
+    .mic-btn:active {
+      transform: scale(0.95);
+    }
+
+    .mic-btn.recording {
+      color: #ef4444;
+      animation: pulse-recording 1s infinite;
+    }
+
+    .mic-btn.recording:hover {
+      color: #f87171;
+    }
+
+    .mic-btn:disabled {
+      opacity: 0.3;
+      cursor: not-allowed;
+    }
+
+    .mic-btn:disabled:hover {
+      background: transparent;
+      transform: none;
+    }
+
+    .mic-btn svg {
+      width: 18px;
+      height: 18px;
+    }
+
+    @keyframes pulse-recording {
+      0%, 100% { opacity: 1; }
+      50% { opacity: 0.5; }
+    }
+
     #message-input {
       flex: 1;
       padding: 8px 12px;
@@ -2037,6 +2091,14 @@
           <path d="M21.44 11.05l-9.19 9.19a6 6 0 01-8.49-8.49l9.19-9.19a4 4 0 015.66 5.66l-9.2 9.19a2 2 0 01-2.83-2.83l8.49-8.48"/>
         </svg>
       </button>
+      <button id="mic-btn" class="mic-btn" onclick="toggleRecording()" title="Voice input" disabled>
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"/>
+          <path d="M19 10v2a7 7 0 0 1-14 0v-2"/>
+          <line x1="12" y1="19" x2="12" y2="23"/>
+          <line x1="8" y1="23" x2="16" y2="23"/>
+        </svg>
+      </button>
       <div class="textarea-wrapper">
         <div id="ghost-suggestion"></div>
         <textarea
@@ -2209,6 +2271,9 @@
 
       // Initialize notification sound
       initNotificationSound();
+
+      // Initialize voice input
+      initVoiceInput();
 
       // Listen for scheduler messages
       window.pocketAgent.onSchedulerMessage((data) => {
@@ -4166,6 +4231,124 @@
 
     function closeAbout() {
       document.getElementById('about-modal').classList.remove('show');
+    }
+
+    // ============ VOICE INPUT ============
+
+    let mediaRecorder = null;
+    let audioChunks = [];
+    let isRecording = false;
+    const micBtn = document.getElementById('mic-btn');
+
+    async function initVoiceInput() {
+      try {
+        const available = await window.pocketAgent.isVoiceAvailable();
+        if (available) {
+          micBtn.disabled = false;
+          micBtn.title = 'Voice input (hold to record)';
+        } else {
+          micBtn.disabled = true;
+          micBtn.title = 'Voice input unavailable (install whisper: pip install openai-whisper)';
+        }
+      } catch (err) {
+        console.error('Failed to check voice availability:', err);
+        micBtn.disabled = true;
+      }
+    }
+
+    async function toggleRecording() {
+      if (isRecording) {
+        stopRecording();
+      } else {
+        await startRecording();
+      }
+    }
+
+    async function startRecording() {
+      try {
+        const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+
+        // Try webm first, fallback to other formats
+        const mimeType = MediaRecorder.isTypeSupported('audio/webm;codecs=opus')
+          ? 'audio/webm;codecs=opus'
+          : MediaRecorder.isTypeSupported('audio/webm')
+            ? 'audio/webm'
+            : 'audio/mp4';
+
+        mediaRecorder = new MediaRecorder(stream, { mimeType });
+        audioChunks = [];
+
+        mediaRecorder.ondataavailable = (e) => {
+          if (e.data.size > 0) {
+            audioChunks.push(e.data);
+          }
+        };
+
+        mediaRecorder.onstop = async () => {
+          // Stop all tracks to release the microphone
+          stream.getTracks().forEach(track => track.stop());
+
+          if (audioChunks.length === 0) {
+            addMessage('system', 'No audio recorded');
+            return;
+          }
+
+          const audioBlob = new Blob(audioChunks, { type: mimeType });
+
+          // Show transcribing status
+          const statusEl = addMessage('system', '🎤 Transcribing...');
+
+          try {
+            const arrayBuffer = await audioBlob.arrayBuffer();
+            const format = mimeType.includes('webm') ? 'webm' : 'mp4';
+            const result = await window.pocketAgent.transcribeAudio(arrayBuffer, format);
+
+            // Remove transcribing status
+            if (statusEl && statusEl.parentNode) {
+              statusEl.remove();
+            }
+
+            if (result.success && result.text) {
+              // Insert transcribed text into input
+              input.value = (input.value ? input.value + ' ' : '') + result.text;
+              autoResizeTextarea();
+              input.focus();
+              playNormalClick();
+            } else {
+              addMessage('system', `Transcription failed: ${result.error || 'Unknown error'}`);
+            }
+          } catch (err) {
+            if (statusEl && statusEl.parentNode) {
+              statusEl.remove();
+            }
+            console.error('Transcription error:', err);
+            addMessage('system', `Transcription error: ${err.message}`);
+          }
+        };
+
+        mediaRecorder.start();
+        isRecording = true;
+        micBtn.classList.add('recording');
+        micBtn.title = 'Recording... (click to stop)';
+        playNormalClick();
+
+      } catch (err) {
+        console.error('Failed to start recording:', err);
+        if (err.name === 'NotAllowedError') {
+          addMessage('system', 'Microphone access denied. Please allow microphone access in System Preferences > Privacy & Security > Microphone.');
+        } else {
+          addMessage('system', `Failed to start recording: ${err.message}`);
+        }
+      }
+    }
+
+    function stopRecording() {
+      if (mediaRecorder && mediaRecorder.state !== 'inactive') {
+        mediaRecorder.stop();
+      }
+      isRecording = false;
+      micBtn.classList.remove('recording');
+      micBtn.title = 'Voice input (click to record)';
     }
   </script>
 </body>
