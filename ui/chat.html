@@ -3,12 +3,15 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src https://fonts.gstatic.com; img-src 'self' data:;">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net https://cdnjs.cloudflare.com; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com https://cdnjs.cloudflare.com; font-src https://fonts.gstatic.com; img-src 'self' data:;">
   <title>Pocket Agent</title>
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=Pixelify+Sans:wght@400;700&family=Sora:wght@400;500;600;700&display=swap" rel="stylesheet">
   <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/themes/prism-tomorrow.min.css">
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/prism.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/plugins/autoloader/prism-autoloader.min.js"></script>
   <style>
     :root {
       --bg-primary: #0a0a0b;
@@ -28,6 +31,18 @@
       --success: #22c55e;
       --radius: 20px;
       --radius-sm: 10px;
+    }
+
+    /* Light theme */
+    [data-theme="light"] {
+      --bg-primary: #ffffff;
+      --bg-secondary: #f5f5f7;
+      --bg-tertiary: #e8e8ed;
+      --border: #d1d1d6;
+      --text-primary: #1d1d1f;
+      --text-secondary: #6e6e73;
+      --text-muted: #8e8e93;
+      --assistant-bubble: #f5f5f7;
     }
 
     * {
@@ -308,6 +323,141 @@
       color: var(--text-muted);
       font-weight: 500;
       line-height: 1;
+    }
+
+    /* Theme Toggle */
+    .theme-toggle {
+      width: 28px;
+      height: 28px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      background: var(--bg-tertiary);
+      border: 1px solid var(--border);
+      border-radius: var(--radius-sm);
+      cursor: pointer;
+      transition: all 0.2s ease;
+      color: var(--text-secondary);
+    }
+
+    .theme-toggle:hover {
+      background: var(--border);
+      color: var(--text-primary);
+    }
+
+    .theme-toggle svg {
+      width: 16px;
+      height: 16px;
+    }
+
+    .theme-toggle .sun-icon { display: none; }
+    .theme-toggle .moon-icon { display: block; }
+    [data-theme="light"] .theme-toggle .sun-icon { display: block; }
+    [data-theme="light"] .theme-toggle .moon-icon { display: none; }
+
+    /* Search Input */
+    .search-container {
+      position: relative;
+      display: flex;
+      align-items: center;
+    }
+
+    .search-input {
+      width: 0;
+      padding: 0;
+      border: none;
+      background: transparent;
+      color: var(--text-primary);
+      font-size: 12px;
+      font-family: inherit;
+      outline: none;
+      transition: width 0.2s ease, padding 0.2s ease, background 0.2s ease;
+    }
+
+    .search-container.expanded .search-input {
+      width: 160px;
+      padding: 6px 10px;
+      background: var(--bg-tertiary);
+      border: 1px solid var(--border);
+      border-radius: var(--radius-sm);
+    }
+
+    .search-input::placeholder {
+      color: var(--text-muted);
+    }
+
+    .search-btn {
+      width: 28px;
+      height: 28px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      background: var(--bg-tertiary);
+      border: 1px solid var(--border);
+      border-radius: var(--radius-sm);
+      cursor: pointer;
+      transition: all 0.15s ease;
+      color: var(--text-secondary);
+    }
+
+    .search-btn:hover {
+      background: var(--border);
+      color: var(--text-primary);
+    }
+
+    .search-btn svg {
+      width: 14px;
+      height: 14px;
+    }
+
+    .search-container.expanded .search-btn {
+      margin-left: 4px;
+    }
+
+    .search-results-info {
+      font-size: 10px;
+      color: var(--text-muted);
+      margin-right: 8px;
+      white-space: nowrap;
+    }
+
+    .search-nav-btn {
+      width: 20px;
+      height: 20px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      background: transparent;
+      border: none;
+      cursor: pointer;
+      color: var(--text-muted);
+      border-radius: 4px;
+    }
+
+    .search-nav-btn:hover {
+      background: var(--bg-tertiary);
+      color: var(--text-primary);
+    }
+
+    .search-nav-btn svg {
+      width: 12px;
+      height: 12px;
+    }
+
+    /* Search highlight */
+    .search-highlight {
+      background: rgba(234, 179, 8, 0.4);
+      border-radius: 2px;
+      padding: 0 1px;
+    }
+
+    .search-highlight.current {
+      background: rgba(234, 179, 8, 0.8);
+      color: #000;
+    }
+
+    .message.search-hidden {
+      display: none;
     }
 
     /* Hamburger Menu */
@@ -1163,6 +1313,29 @@
       50% { transform: scale(1.02); }
     }
 
+    /* Error state - red warning */
+    .status-indicator.status-error {
+      border-color: var(--error);
+      background: linear-gradient(135deg, rgba(239, 68, 68, 0.1) 0%, rgba(239, 68, 68, 0.05) 100%);
+    }
+
+    .status-indicator.status-error .status-action {
+      background: var(--error);
+      -webkit-background-clip: text;
+      background-clip: text;
+      -webkit-text-fill-color: transparent;
+      animation: none;
+    }
+
+    .status-indicator.status-error .status-detail {
+      color: var(--text-muted);
+      font-size: 10px;
+    }
+
+    .status-indicator.status-error .status-spinner {
+      display: none;
+    }
+
     .status-detail {
       font-size: 12px;
       color: var(--text-muted);
@@ -1898,7 +2071,43 @@
       <h1>Pocket Agent<span id="version-badge" class="version-badge"></span><span id="model-badge" class="model-badge"></span><span id="update-badge" class="update-badge" onclick="openSettings('updates')">Update</span></h1>
     </div>
     <div class="header-right">
+      <div class="search-container" id="search-container">
+        <span class="search-results-info" id="search-results-info" style="display: none;"></span>
+        <button class="search-nav-btn" id="search-prev" style="display: none;" onclick="navigateSearch(-1)">
+          <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <polyline points="18 15 12 9 6 15"></polyline>
+          </svg>
+        </button>
+        <button class="search-nav-btn" id="search-next" style="display: none;" onclick="navigateSearch(1)">
+          <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <polyline points="6 9 12 15 18 9"></polyline>
+          </svg>
+        </button>
+        <input type="text" class="search-input" id="search-input" placeholder="Search messages..." oninput="performSearch(this.value)">
+        <button class="search-btn" id="search-btn" onclick="toggleSearch()">
+          <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <circle cx="11" cy="11" r="8"></circle>
+            <line x1="21" y1="21" x2="16.65" y2="16.65"></line>
+          </svg>
+        </button>
+      </div>
       <div class="stats" id="stats"></div>
+      <button class="theme-toggle" onclick="playNormalClick(); toggleTheme()" title="Toggle theme">
+        <svg class="sun-icon" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <circle cx="12" cy="12" r="5"></circle>
+          <line x1="12" y1="1" x2="12" y2="3"></line>
+          <line x1="12" y1="21" x2="12" y2="23"></line>
+          <line x1="4.22" y1="4.22" x2="5.64" y2="5.64"></line>
+          <line x1="18.36" y1="18.36" x2="19.78" y2="19.78"></line>
+          <line x1="1" y1="12" x2="3" y2="12"></line>
+          <line x1="21" y1="12" x2="23" y2="12"></line>
+          <line x1="4.22" y1="19.78" x2="5.64" y2="18.36"></line>
+          <line x1="18.36" y1="5.64" x2="19.78" y2="4.22"></line>
+        </svg>
+        <svg class="moon-icon" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"></path>
+        </svg>
+      </button>
       <div class="hamburger-menu">
         <button class="hamburger-btn" onclick="playNormalClick(); toggleMenu()" id="hamburger-btn">
           <span></span>
@@ -2243,6 +2452,22 @@
 
     const IMAGE_EXTENSIONS = new Set(['png', 'jpg', 'jpeg', 'gif', 'webp', 'svg', 'bmp', 'ico']);
     const MAX_FILE_SIZE = 10 * 1024 * 1024; // 10MB
+
+    // Theme management
+    function initTheme() {
+      const savedTheme = localStorage.getItem('theme') || 'dark';
+      document.documentElement.setAttribute('data-theme', savedTheme);
+    }
+
+    function toggleTheme() {
+      const currentTheme = document.documentElement.getAttribute('data-theme') || 'dark';
+      const newTheme = currentTheme === 'dark' ? 'light' : 'dark';
+      document.documentElement.setAttribute('data-theme', newTheme);
+      localStorage.setItem('theme', newTheme);
+    }
+
+    // Initialize theme immediately (before DOMContentLoaded)
+    initTheme();
 
     // Initialize
     window.addEventListener('DOMContentLoaded', async () => {
@@ -2763,6 +2988,7 @@
       const contentDiv = document.createElement('div');
       contentDiv.className = 'message-content';
       contentDiv.innerHTML = formatContent(content);
+      applySyntaxHighlighting(contentDiv);
       // Intercept link clicks to open in external browser
       contentDiv.addEventListener('click', (e) => {
         const link = e.target.closest('a[href]');
@@ -3212,10 +3438,12 @@
       if (content) {
         const contentDiv = document.createElement('div');
         contentDiv.innerHTML = formatContent(content);
+        applySyntaxHighlighting(contentDiv);
         // Append children directly to avoid nesting issues
         while (contentDiv.firstChild) {
           div.appendChild(contentDiv.firstChild);
         }
+        applySyntaxHighlighting(div);
         // Intercept link clicks to open in external browser
         div.addEventListener('click', (e) => {
           const link = e.target.closest('a[href]');
@@ -3487,9 +3715,29 @@
           streamingEl.classList.remove('streaming');
           // Mark it so sendMessage knows not to add another message
           streamingEl.dataset.streamingComplete = 'true';
+          // Render markdown and apply syntax highlighting
+          const contentEl = streamingEl.querySelector('.streaming-content');
+          if (contentEl) {
+            const rawText = contentEl.textContent || '';
+            contentEl.innerHTML = formatContent(rawText);
+            applySyntaxHighlighting(contentEl);
+          }
         }
         // Play notification sound
         playNotificationSound();
+      } else if (status.type === 'error') {
+        // Error occurred - show in status indicator with error styling
+        statusEl.classList.add('status-error');
+        statusEl.classList.remove('subagent-active', 'tool-blocked');
+        actionEl.textContent = status.message || 'something went wrong!';
+        if (status.errorDetails && status.errorDetails !== status.message) {
+          detailEl.textContent = status.errorType ? `[${status.errorType}]` : '';
+          detailEl.title = status.errorDetails;
+          detailEl.style.display = status.errorType ? 'block' : 'none';
+        } else {
+          detailEl.textContent = '';
+          detailEl.style.display = 'none';
+        }
       }
 
       scrollToBottom();
@@ -3838,6 +4086,17 @@
         return;
       }
 
+      // Ctrl/Cmd+Enter: Send message
+      if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) {
+        e.preventDefault();
+        if (getCurrentSuggestion() && !input.value.trim()) {
+          input.value = getCurrentSuggestion();
+          clearSuggestion();
+        }
+        sendMessage();
+        return;
+      }
+
       // Enter: Send message (or suggestion if no user input)
       if (e.key === 'Enter' && !e.shiftKey) {
         e.preventDefault();
@@ -3850,13 +4109,38 @@
         return;
       }
 
-      // Escape: Clear the suggestion
-      if (e.key === 'Escape' && getCurrentSuggestion()) {
+      // Escape: Clear input or suggestion
+      if (e.key === 'Escape') {
         e.preventDefault();
-        clearSuggestion();
+        if (getCurrentSuggestion()) {
+          clearSuggestion();
+        } else if (input.value.trim()) {
+          input.value = '';
+          autoResizeTextarea();
+        }
         return;
       }
     }
+
+    // Global keyboard shortcuts
+    document.addEventListener('keydown', (e) => {
+      const isMod = e.ctrlKey || e.metaKey;
+
+      // Ctrl/Cmd+N: New chat
+      if (isMod && e.key === 'n') {
+        e.preventDefault();
+        playNormalClick();
+        createNewSession();
+        return;
+      }
+
+      // Ctrl/Cmd+K: Focus input
+      if (isMod && e.key === 'k') {
+        e.preventDefault();
+        input.focus();
+        return;
+      }
+    });
 
     function handleInput(e) {
       // When user types, clear the suggestion
@@ -3882,6 +4166,19 @@
       ghostSuggestion.innerHTML = '';
       ghostSuggestion.style.display = 'none';
       input.classList.remove('has-suggestion');
+    }
+
+    function autoResizeTextarea() {
+      input.style.height = 'auto';
+      input.style.height = Math.min(input.scrollHeight, 150) + 'px';
+    }
+
+    function handleInput(e) {
+      autoResizeTextarea();
+      // Clear suggestion when user starts typing
+      if (input.value.trim() && getCurrentSuggestion()) {
+        clearSuggestion();
+      }
     }
 
     function acceptSuggestion() {
@@ -4350,6 +4647,53 @@
       micBtn.classList.remove('recording');
       micBtn.title = 'Voice input (click to record)';
     }
+
+    // Apply syntax highlighting to code blocks
+    function applySyntaxHighlighting(element) {
+      if (typeof Prism !== 'undefined') {
+        const codeBlocks = element.querySelectorAll('pre code');
+        codeBlocks.forEach(block => {
+          // Try to detect language from class
+          const langClass = Array.from(block.classList).find(c => c.startsWith('language-'));
+          if (!langClass) {
+            // Try to detect from parent pre
+            const preLangClass = Array.from(block.parentElement.classList).find(c => c.startsWith('language-'));
+            if (preLangClass) {
+              block.classList.add(preLangClass);
+            }
+          }
+          Prism.highlightElement(block);
+        });
+      }
+    }
+
+    // Handle keyboard shortcut for search (Cmd/Ctrl + F)
+    document.addEventListener('keydown', (e) => {
+      if ((e.metaKey || e.ctrlKey) && e.key === 'f') {
+        e.preventDefault();
+        const container = document.getElementById('search-container');
+        if (!container.classList.contains('expanded')) {
+          toggleSearch();
+        } else {
+          document.getElementById('search-input').focus();
+        }
+      }
+      // Escape to close search
+      if (e.key === 'Escape') {
+        const container = document.getElementById('search-container');
+        if (container.classList.contains('expanded')) {
+          toggleSearch();
+        }
+      }
+      // Enter to navigate to next match
+      if (e.key === 'Enter' && document.activeElement.id === 'search-input') {
+        if (e.shiftKey) {
+          navigateSearch(-1);
+        } else {
+          navigateSearch(1);
+        }
+      }
+    });
   </script>
 </body>
 </html>

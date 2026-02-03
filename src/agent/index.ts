@@ -1,3 +1,8 @@
+/**
+ * AgentManager - Main orchestrator for the Claude Agent SDK
+ * Thin wrapper that delegates to specialized modules
+ */
+
 import { MemoryManager, Message, SmartContextOptions } from '../memory';
 import { buildMCPServers, buildSdkMcpServers, setMemoryManager, setSoulMemoryManager, ToolsConfig, validateToolsConfig, setCurrentSessionId } from '../tools';
 import { closeBrowserManager } from '../browser';
@@ -7,98 +12,81 @@ import { SettingsManager } from '../settings';
 import { EventEmitter } from 'events';
 import { buildCanUseToolCallback, buildPreToolUseHook, setStatusEmitter } from './safety';
 
+// Import from local modules
+import { isSimpleQuery, THINKING_BUDGETS } from './complexity';
+import { MessageStatusProcessor, extractTextFromMessage } from './message-processor';
+import {
+  AgentStatus,
+  AgentConfig,
+  ProcessResult,
+  ImageContent,
+  AttachmentInfo,
+  ProviderType,
+  ProviderConfig,
+  ContentBlock,
+  SDKOptions,
+  SDKUserMessage,
+  SDKQuery,
+} from './types';
+
+// Re-export types for external consumers
+export type { AgentStatus, AgentConfig, ProcessResult, ImageContent, AttachmentInfo };
+
 // Smart context defaults
 const DEFAULT_RECENT_MESSAGE_LIMIT = 20;
 const DEFAULT_ROLLING_SUMMARY_INTERVAL = 50;
 const DEFAULT_SEMANTIC_RETRIEVAL_COUNT = 5;
 
-// Provider configuration for different LLM backends
-type ProviderType = 'anthropic' | 'moonshot' | 'glm';
-
-interface ProviderConfig {
-  baseUrl?: string;
-}
-
 const PROVIDER_CONFIGS: Record<ProviderType, ProviderConfig> = {
-  'anthropic': {
-    // No baseUrl = uses default Anthropic endpoint
-  },
-  'moonshot': {
-    baseUrl: 'https://api.moonshot.ai/anthropic/',
-  },
-  'glm': {
-    baseUrl: 'https://api.z.ai/api/anthropic/',
-  },
+  'anthropic': {},
+  'moonshot': { baseUrl: 'https://api.moonshot.ai/anthropic/' },
+  'glm': { baseUrl: 'https://api.z.ai/api/anthropic/' },
 };
 
-// Model to provider mapping
 const MODEL_PROVIDERS: Record<string, ProviderType> = {
-  // Anthropic models
   'claude-opus-4-5-20251101': 'anthropic',
   'claude-sonnet-4-5-20250929': 'anthropic',
   'claude-haiku-4-5-20251001': 'anthropic',
-  // Moonshot/Kimi models
   'kimi-k2.5': 'moonshot',
-  // Z.AI GLM models
   'glm-4.7': 'glm',
 };
 
-/**
- * Get the provider type for a model
- */
 function getProviderForModel(model: string): ProviderType {
   return MODEL_PROVIDERS[model] || 'anthropic';
 }
 
-/**
- * Configure environment variables for the selected provider
- * This is called before each SDK query to ensure correct routing
- */
 function configureProviderEnvironment(model: string): void {
   const provider = getProviderForModel(model);
   const config = PROVIDER_CONFIGS[provider];
 
-  // Clear all provider-related env vars first
   delete process.env.ANTHROPIC_BASE_URL;
   delete process.env.ANTHROPIC_AUTH_TOKEN;
-  // Note: ANTHROPIC_API_KEY may be set by OAuth or settings, don't clear if using Anthropic
 
   if (provider === 'moonshot') {
-    // Moonshot requires base URL and uses Bearer token auth
     const moonshotKey = SettingsManager.get('moonshot.apiKey');
     if (!moonshotKey) {
       throw new Error('Moonshot API key not configured. Please add your key in Settings > Keys.');
     }
-
     process.env.ANTHROPIC_BASE_URL = config.baseUrl;
     process.env.ANTHROPIC_AUTH_TOKEN = moonshotKey;
-    // Clear ANTHROPIC_API_KEY so SDK uses AUTH_TOKEN instead
     delete process.env.ANTHROPIC_API_KEY;
-
     console.log('[AgentManager] Provider configured: Moonshot (Kimi)');
   } else if (provider === 'glm') {
-    // Z.AI GLM requires base URL and uses Bearer token auth
     const glmKey = SettingsManager.get('glm.apiKey');
     if (!glmKey) {
       throw new Error('Z.AI GLM API key not configured. Please add your key in Settings > LLM.');
     }
-
     process.env.ANTHROPIC_BASE_URL = config.baseUrl;
     process.env.ANTHROPIC_AUTH_TOKEN = glmKey;
-    // Clear ANTHROPIC_API_KEY so SDK uses AUTH_TOKEN instead
     delete process.env.ANTHROPIC_API_KEY;
-
     console.log('[AgentManager] Provider configured: Z.AI GLM');
   } else {
-    // Anthropic provider - ensure no base URL override
     delete process.env.ANTHROPIC_BASE_URL;
     delete process.env.ANTHROPIC_AUTH_TOKEN;
-
     console.log('[AgentManager] Provider configured: Anthropic');
   }
 }
 
-// Get smart context options from settings
 function getSmartContextOptions(currentQuery?: string): SmartContextOptions {
   return {
     recentMessageLimit: Number(SettingsManager.get('agent.recentMessageLimit')) || DEFAULT_RECENT_MESSAGE_LIMIT,
@@ -108,100 +96,10 @@ function getSmartContextOptions(currentQuery?: string): SmartContextOptions {
   };
 }
 
-// Status event types
-export type AgentStatus = {
-  type: 'thinking' | 'tool_start' | 'tool_end' | 'tool_blocked' | 'responding' | 'done' | 'subagent_start' | 'subagent_update' | 'subagent_end' | 'queued' | 'queue_processing' | 'text_delta';
-  toolName?: string;
-  toolInput?: string;
-  message?: string;
-  // Subagent tracking
-  agentId?: string;
-  agentType?: string;
-  agentCount?: number;  // Number of active subagents
-  // Queue tracking
-  queuePosition?: number;
-  queuedMessage?: string;
-  // Safety blocking
-  blockedReason?: string;
-  // Streaming text
-  textDelta?: string;
-  isFirstChunk?: boolean;
-};
-
-// SDK types (loaded dynamically)
-type SDKQuery = AsyncGenerator<unknown, void>;
-type CanUseToolCallback = (
-  toolName: string,
-  input: Record<string, unknown>,
-  options: { signal: AbortSignal; toolUseID: string }
-) => Promise<{ behavior: 'allow' } | { behavior: 'deny'; message: string; interrupt: boolean }>;
-type PreToolUseHookCallback = (input: { tool_name: string; tool_input: unknown }) => Promise<{
-  hookSpecificOutput: {
-    hookEventName: 'PreToolUse';
-    permissionDecision: 'allow' | 'deny';
-    permissionDecisionReason?: string;
-  };
-}>;
-type SDKOptions = {
-  model?: string;
-  cwd?: string;
-  maxTurns?: number;
-  maxThinkingTokens?: number;
-  abortController?: AbortController;
-  tools?: string[] | { type: 'preset'; preset: 'claude_code' };
-  allowedTools?: string[];
-  persistSession?: boolean;
-  systemPrompt?: string | { type: 'preset'; preset: 'claude_code'; append?: string };
-  mcpServers?: Record<string, unknown>;
-  settingSources?: ('project' | 'user')[];  // Load skills from .claude/skills/
-  canUseTool?: CanUseToolCallback;  // Pre-tool-use validation callback
-  hooks?: {
-    PreToolUse?: Array<{ hooks: PreToolUseHookCallback[] }>;
-  };
-};
-
-// Thinking level to token budget mapping
-const THINKING_BUDGETS: Record<string, number | undefined> = {
-  'none': 0,
-  'minimal': 2048,
-  'normal': 10000,
-  'extended': 32000,
-};
-
-// Image content for multimodal messages
-export interface ImageContent {
-  type: 'base64';
-  mediaType: 'image/jpeg' | 'image/png' | 'image/gif' | 'image/webp';
-  data: string;  // base64 encoded
-}
-
-// Attachment info for tracking attachments in metadata
-export interface AttachmentInfo {
-  hasAttachment: boolean;
-  attachmentType?: 'photo' | 'voice' | 'audio';
-}
-
-// Content block types for SDK
-type TextBlock = { type: 'text'; text: string };
-type ImageBlock = { type: 'image'; source: { type: 'base64'; media_type: string; data: string } };
-type ContentBlock = TextBlock | ImageBlock;
-
-// SDK User Message type for async iterable
-interface SDKUserMessage {
-  type: 'user';
-  message: {
-    role: 'user';
-    content: string | ContentBlock[];
-  };
-  parent_tool_use_id: string | null;
-  session_id: string;
-}
-
-// Dynamic SDK loader - prompt can be string or async iterable of messages
+// Dynamic SDK loader
 let sdkQuery: ((params: { prompt: string | AsyncIterable<SDKUserMessage>; options?: SDKOptions }) => SDKQuery) | null = null;
 let sdkLoadPromise: Promise<typeof sdkQuery> | null = null;
 
-// Use Function to preserve native import() - TypeScript converts import() to require() in CommonJS
 const dynamicImport = new Function('specifier', 'return import(specifier)') as (specifier: string) => Promise<unknown>;
 
 async function loadSDK(): Promise<typeof sdkQuery> {
@@ -218,46 +116,8 @@ async function loadSDK(): Promise<typeof sdkQuery> {
   return sdkQuery;
 }
 
-/**
- * Pre-warm the SDK by loading it in the background.
- * Call this at app startup to reduce first-query latency.
- */
 export function prewarmSDK(): void {
   loadSDK().catch(err => console.error('[AgentManager] SDK prewarm failed:', err));
-}
-
-/**
- * Check if a query is "simple" (casual chat, short questions).
- * Simple queries skip expensive semantic search and use less thinking.
- */
-function isSimpleQuery(message: string): boolean {
-  // Very short messages are simple
-  if (message.length < 30) return true;
-
-  // Greetings and casual phrases
-  const casualPatterns = /^(hi|hey|hello|yo|sup|thanks|ok|okay|yes|no|sure|got it|cool|nice|great|good|yep|nope|k|ty|thx)\b/i;
-  if (casualPatterns.test(message.trim())) return true;
-
-  // Single words or very few words (less than 4)
-  const wordCount = message.trim().split(/\s+/).length;
-  if (wordCount <= 3) return true;
-
-  return false;
-}
-
-export interface AgentConfig {
-  memory: MemoryManager;
-  projectRoot?: string;
-  workspace?: string;  // Isolated working directory for agent file operations
-  model?: string;
-  tools?: ToolsConfig;
-}
-
-export interface ProcessResult {
-  response: string;
-  tokensUsed: number;
-  wasCompacted: boolean;
-  suggestedPrompt?: string;
 }
 
 /**
@@ -267,7 +127,7 @@ class AgentManagerClass extends EventEmitter {
   private static instance: AgentManagerClass | null = null;
   private memory: MemoryManager | null = null;
   private projectRoot: string = process.cwd();
-  private workspace: string = process.cwd();  // Isolated working directory for agent
+  private workspace: string = process.cwd();
   private model: string = 'claude-opus-4-5-20251101';
   private toolsConfig: ToolsConfig | null = null;
   private initialized: boolean = false;
@@ -277,11 +137,11 @@ class AgentManagerClass extends EventEmitter {
   private processingBySession: Map<string, boolean> = new Map();
   private lastSuggestedPrompt: string | undefined = undefined;
   private messageQueueBySession: Map<string, Array<{ message: string; channel: string; images?: ImageContent[]; attachmentInfo?: AttachmentInfo; resolve: (result: ProcessResult) => void; reject: (error: Error) => void }>> = new Map();
-  // Track tools used during current query for better empty response handling
-  private toolsUsedInQuery: string[] = [];
+  private messageStatusProcessor: MessageStatusProcessor;
 
   private constructor() {
     super();
+    this.messageStatusProcessor = new MessageStatusProcessor(this);
   }
 
   static getInstance(): AgentManagerClass {
@@ -305,7 +165,6 @@ class AgentManagerClass extends EventEmitter {
     setMemoryManager(this.memory);
     setSoulMemoryManager(this.memory);
 
-    // Set up safety status emitter for UI feedback on blocked tools
     setStatusEmitter((status) => {
       this.emitStatus(status);
     });
@@ -322,30 +181,21 @@ class AgentManagerClass extends EventEmitter {
       if (!validation.valid) {
         console.warn('[AgentManager] Tool config issues:', validation.errors);
       }
-
       if (this.toolsConfig.browser.enabled) {
         console.log('[AgentManager] Browser: 2-tier (Electron, CDP)');
       }
     }
 
-    // Backfill message embeddings asynchronously (for semantic retrieval)
     this.backfillMessageEmbeddings().catch(e => {
       console.error('[AgentManager] Embedding backfill failed:', e);
     });
 
-    // Pre-warm SDK to reduce first-query latency
     console.log('[AgentManager] Pre-warming SDK...');
     prewarmSDK();
   }
 
-  /**
-   * Backfill embeddings for messages that don't have them yet.
-   * Runs asynchronously in the background during initialization.
-   */
   private async backfillMessageEmbeddings(): Promise<void> {
     if (!this.memory) return;
-
-    // Get all sessions and backfill each
     const sessions = this.memory.getSessions();
     for (const session of sessions) {
       const embedded = await this.memory.embedRecentMessages(session.id, 100);
@@ -370,7 +220,6 @@ class AgentManagerClass extends EventEmitter {
       throw new Error('AgentManager not initialized - call initialize() first');
     }
 
-    // If already processing, queue the message
     if (this.processingBySession.get(sessionId)) {
       return this.queueMessage(userMessage, channel, sessionId, images, attachmentInfo);
     }
@@ -378,9 +227,6 @@ class AgentManagerClass extends EventEmitter {
     return this.executeMessage(userMessage, channel, sessionId, images, attachmentInfo);
   }
 
-  /**
-   * Queue a message to be processed after the current one finishes
-   */
   private queueMessage(
     userMessage: string,
     channel: string,
@@ -389,19 +235,15 @@ class AgentManagerClass extends EventEmitter {
     attachmentInfo?: AttachmentInfo
   ): Promise<ProcessResult> {
     return new Promise((resolve, reject) => {
-      // Get or create queue for this session
       if (!this.messageQueueBySession.has(sessionId)) {
         this.messageQueueBySession.set(sessionId, []);
       }
       const queue = this.messageQueueBySession.get(sessionId)!;
-
-      // Add to queue
       queue.push({ message: userMessage, channel, images, attachmentInfo, resolve, reject });
 
       const queuePosition = queue.length;
       console.log(`[AgentManager] Message queued at position ${queuePosition} for session ${sessionId}`);
 
-      // Emit queued status
       this.emitStatus({
         type: 'queued',
         queuePosition,
@@ -411,9 +253,6 @@ class AgentManagerClass extends EventEmitter {
     });
   }
 
-  /**
-   * Process the next message in the queue for a session
-   */
   private async processQueue(sessionId: string): Promise<void> {
     const queue = this.messageQueueBySession.get(sessionId);
     if (!queue || queue.length === 0) return;
@@ -421,7 +260,6 @@ class AgentManagerClass extends EventEmitter {
     const next = queue.shift()!;
     console.log(`[AgentManager] Processing queued message for session ${sessionId}, ${queue.length} remaining`);
 
-    // Emit status that we're processing a queued message
     this.emitStatus({
       type: 'queue_processing',
       queuedMessage: next.message.slice(0, 100),
@@ -436,9 +274,6 @@ class AgentManagerClass extends EventEmitter {
     }
   }
 
-  /**
-   * Actually execute a message (internal implementation)
-   */
   private async executeMessage(
     userMessage: string,
     channel: string,
@@ -446,33 +281,27 @@ class AgentManagerClass extends EventEmitter {
     images?: ImageContent[],
     attachmentInfo?: AttachmentInfo
   ): Promise<ProcessResult> {
-    // Memory should already be checked by processMessage, but guard anyway
     if (!this.memory) {
       throw new Error('AgentManager not initialized - call initialize() first');
     }
 
-    const memory = this.memory; // Local reference for TypeScript narrowing
-
+    const memory = this.memory;
     this.processingBySession.set(sessionId, true);
     const abortController = new AbortController();
     this.abortControllersBySession.set(sessionId, abortController);
     this.lastSuggestedPrompt = undefined;
-    this.toolsUsedInQuery = [];  // Reset tool tracking for new query
+    this.messageStatusProcessor.resetToolTracking();
     let wasCompacted = false;
 
-    // Timing instrumentation
     const queryStartTime = Date.now();
     const isSimple = isSimpleQuery(userMessage);
     console.log(`[AgentManager] Query type: ${isSimple ? 'SIMPLE' : 'complex'} (${userMessage.length} chars)`);
     console.time('[AgentManager] Total query time');
 
-    // Set session context for MCP tools to use
     setCurrentSessionId(sessionId);
 
     try {
       console.time('[AgentManager] Context building');
-      // Use smart context: recent messages + rolling summary + semantic retrieval
-      // Skip semantic search for simple queries to reduce latency
       const smartContextOptions = getSmartContextOptions(isSimple ? undefined : userMessage);
       const smartContext = await memory.getSmartContext(sessionId, smartContextOptions);
       console.timeEnd('[AgentManager] Context building');
@@ -481,45 +310,11 @@ class AgentManagerClass extends EventEmitter {
 
       console.log(`[AgentManager] Smart context: ${smartContext.stats.recentCount} recent, ${smartContext.stats.summarizedMessages} summarized, ${smartContext.stats.relevantCount} relevant (${smartContext.totalTokens} tokens)`);
 
-      const contextParts: string[] = [];
-
-      // Add rolling summary of older conversations
-      if (smartContext.rollingSummary) {
-        contextParts.push(`[Summary of previous conversations]\n${smartContext.rollingSummary}`);
-      }
-
-      // Add semantically relevant past messages
-      if (smartContext.relevantMessages.length > 0) {
-        const relevantText = smartContext.relevantMessages
-          .map(m => {
-            const timeStr = m.timestamp ? this.formatMessageTimestamp(m.timestamp) : '';
-            const prefix = timeStr ? `${m.role.toUpperCase()} [${timeStr}]` : m.role.toUpperCase();
-            return `${prefix}: ${m.content}`;
-          })
-          .join('\n\n');
-        contextParts.push(`[Relevant past context]\n${relevantText}`);
-      }
-
-      // Add recent conversation
-      if (smartContext.recentMessages.length > 0) {
-        const historyText = smartContext.recentMessages
-          .map(m => {
-            const timeStr = m.timestamp ? this.formatMessageTimestamp(m.timestamp) : '';
-            const prefix = timeStr ? `${m.role.toUpperCase()} [${timeStr}]` : m.role.toUpperCase();
-            return `${prefix}: ${m.content}`;
-          })
-          .join('\n\n');
-        contextParts.push(`[Recent conversation]\n${historyText}`);
-      }
-
-      const fullPromptText = contextParts.length > 0
-        ? `${contextParts.join('\n\n---\n\n')}\n\n---\n\nUser: ${userMessage}`
-        : userMessage;
+      const fullPromptText = this.buildPromptText(smartContext, userMessage);
 
       const query = await loadSDK();
       if (!query) throw new Error('Failed to load SDK');
 
-      // Get last user message timestamp for temporal context
       const userMessages = smartContext.recentMessages.filter(m => m.role === 'user');
       const lastUserMessageTimestamp = userMessages.length > 0
         ? userMessages[userMessages.length - 1].timestamp
@@ -529,17 +324,14 @@ class AgentManagerClass extends EventEmitter {
       const options = await this.buildOptions(factsContext, soulContext, abortController, lastUserMessageTimestamp, isSimple);
       console.timeEnd('[AgentManager] Build options');
 
-      // Configure provider environment based on model (sets ANTHROPIC_BASE_URL, AUTH_TOKEN, etc.)
       configureProviderEnvironment(this.model);
 
-      // Build prompt - use async generator for images, string for text-only
       let queryResult;
       console.log('[AgentManager] Calling query() with model:', options.model, 'thinking:', options.maxThinkingTokens || 'default');
       console.time('[AgentManager] SDK query');
       this.emitStatus({ type: 'thinking', message: '*stretches paws* thinking...' });
 
       if (images && images.length > 0) {
-        // For images, create an async generator that yields SDKUserMessage
         const contentBlocks: ContentBlock[] = [
           { type: 'text', text: fullPromptText },
           ...images.map(img => ({
@@ -569,20 +361,21 @@ class AgentManagerClass extends EventEmitter {
       } else {
         queryResult = query({ prompt: fullPromptText, options });
       }
+
       let response = '';
       let isFirstTextChunk = true;
 
       for await (const message of queryResult) {
-        // Check if aborted
         if (abortController.signal.aborted) {
           console.log('[AgentManager] Query aborted by user');
           throw new Error('Query stopped by user');
         }
-        this.processStatusFromMessage(message);
+        this.messageStatusProcessor.processMessage(message);
         const prevLength = response.length;
-        response = this.extractFromMessage(message, response);
+        response = extractTextFromMessage(message, response, (suggestion) => {
+          this.lastSuggestedPrompt = suggestion;
+        });
 
-        // Emit text delta if response grew (streaming)
         if (response.length > prevLength) {
           const delta = response.slice(prevLength);
           this.emitStatus({
@@ -597,11 +390,11 @@ class AgentManagerClass extends EventEmitter {
 
       this.emitStatus({ type: 'done' });
 
-      // If no text response, build informative fallback based on what tools were used
       if (!response) {
-        if (this.toolsUsedInQuery.length > 0) {
-          const toolsSummary = this.toolsUsedInQuery.slice(0, 5).join(', ');
-          const moreCount = this.toolsUsedInQuery.length > 5 ? ` (+${this.toolsUsedInQuery.length - 5} more)` : '';
+        const toolsUsed = this.messageStatusProcessor.getToolsUsed();
+        if (toolsUsed.length > 0) {
+          const toolsSummary = toolsUsed.slice(0, 5).join(', ');
+          const moreCount = toolsUsed.length > 5 ? ` (+${toolsUsed.length - 5} more)` : '';
           console.log(`[AgentManager] Empty response after tools: ${toolsSummary}${moreCount}`);
           response = `done! used: ${toolsSummary}${moreCount}`;
         } else {
@@ -610,47 +403,37 @@ class AgentManagerClass extends EventEmitter {
         }
       }
 
-      // Skip saving HEARTBEAT_OK responses from scheduled jobs to memory/chat
       const isScheduledJob = channel.startsWith('cron:');
       const isHeartbeat = response.toUpperCase().includes('HEARTBEAT_OK');
 
       if (isScheduledJob && isHeartbeat) {
         console.log('[AgentManager] Skipping HEARTBEAT_OK from scheduled job - not saving to memory');
       } else {
-        // Clean up scheduled job messages before saving - remove internal LLM instructions
         let messageToSave = userMessage;
-
-        // Strip the heartbeat instruction suffix (for routines)
         const heartbeatSuffix = '\n\nIf nothing needs attention, reply with only HEARTBEAT_OK.';
         if (messageToSave.endsWith(heartbeatSuffix)) {
           messageToSave = messageToSave.slice(0, -heartbeatSuffix.length);
         }
 
-        // Convert reminder prompts to clean display format (for reminders)
         const reminderMatch = messageToSave.match(/^\[SCHEDULED REMINDER - DELIVER NOW\]\nThe user previously asked to be reminded about: "(.+?)"\n\nDeliver this reminder/);
         if (reminderMatch) {
           messageToSave = `Reminder: ${reminderMatch[1]}`;
         }
 
-        // Add metadata for message source and attachments
         let metadata: Record<string, unknown> | undefined;
         if (channel.startsWith('cron:')) {
           metadata = { source: 'scheduler', jobName: channel.slice(5) };
         } else if (channel === 'telegram') {
-          // Use explicit attachmentInfo if provided, otherwise check for images
           const hasAttachment = attachmentInfo?.hasAttachment ?? (images && images.length > 0);
           const attachmentType = attachmentInfo?.attachmentType ?? (images && images.length > 0 ? 'photo' : undefined);
           metadata = { source: 'telegram', hasAttachment, attachmentType };
         }
 
         const userMsgId = memory.saveMessage('user', messageToSave, sessionId, metadata);
-        // Assistant response doesn't need hasAttachment but keep source for consistency
         const assistantMetadata = metadata ? { source: metadata.source } : undefined;
         const assistantMsgId = memory.saveMessage('assistant', response, sessionId, assistantMetadata);
         console.log('[AgentManager] Saved messages to SQLite (session: ' + sessionId + ')');
 
-        // Embed messages asynchronously for future semantic retrieval
-        // Don't await - let it run in background
         memory.embedMessage(userMsgId).catch(e => console.error('[AgentManager] Failed to embed user message:', e));
         memory.embedMessage(assistantMsgId).catch(e => console.error('[AgentManager] Failed to embed assistant message:', e));
       }
@@ -671,10 +454,18 @@ class AgentManagerClass extends EventEmitter {
       if (error instanceof Error && error.stack) {
         console.error('[AgentManager] Stack trace:', error.stack);
       }
-      // Log full error object for debugging
       console.error('[AgentManager] Full error:', JSON.stringify(error, Object.getOwnPropertyNames(error), 2));
 
-      // Only save user message if not aborted
+      const errorType = this.categorizeError(errorMsg);
+      const friendlyMessage = this.getFriendlyErrorMessage(errorType, errorMsg);
+
+      this.emitStatus({
+        type: 'error',
+        message: friendlyMessage,
+        errorType,
+        errorDetails: errorMsg,
+      });
+
       if (!abortController.signal.aborted) {
         memory.saveMessage('user', userMessage, sessionId);
       }
@@ -687,8 +478,6 @@ class AgentManagerClass extends EventEmitter {
       this.processingBySession.set(sessionId, false);
       this.abortControllersBySession.delete(sessionId);
 
-      // Process next message in queue (if any)
-      // Use setTimeout(0) to avoid blocking the current promise resolution
       setTimeout(() => {
         this.processQueue(sessionId).catch((err) => {
           console.error('[AgentManager] Queue processing failed:', err);
@@ -697,39 +486,59 @@ class AgentManagerClass extends EventEmitter {
     }
   }
 
-  /**
-   * Get the number of queued messages for a session
-   */
+  private buildPromptText(smartContext: Awaited<ReturnType<MemoryManager['getSmartContext']>>, userMessage: string): string {
+    const contextParts: string[] = [];
+
+    if (smartContext.rollingSummary) {
+      contextParts.push(`[Summary of previous conversations]\n${smartContext.rollingSummary}`);
+    }
+
+    if (smartContext.relevantMessages.length > 0) {
+      const relevantText = smartContext.relevantMessages
+        .map(m => {
+          const timeStr = m.timestamp ? this.formatMessageTimestamp(m.timestamp) : '';
+          const prefix = timeStr ? `${m.role.toUpperCase()} [${timeStr}]` : m.role.toUpperCase();
+          return `${prefix}: ${m.content}`;
+        })
+        .join('\n\n');
+      contextParts.push(`[Relevant past context]\n${relevantText}`);
+    }
+
+    if (smartContext.recentMessages.length > 0) {
+      const historyText = smartContext.recentMessages
+        .map(m => {
+          const timeStr = m.timestamp ? this.formatMessageTimestamp(m.timestamp) : '';
+          const prefix = timeStr ? `${m.role.toUpperCase()} [${timeStr}]` : m.role.toUpperCase();
+          return `${prefix}: ${m.content}`;
+        })
+        .join('\n\n');
+      contextParts.push(`[Recent conversation]\n${historyText}`);
+    }
+
+    return contextParts.length > 0
+      ? `${contextParts.join('\n\n---\n\n')}\n\n---\n\nUser: ${userMessage}`
+      : userMessage;
+  }
+
   getQueueLength(sessionId: string = 'default'): number {
     return this.messageQueueBySession.get(sessionId)?.length || 0;
   }
 
-  /**
-   * Clear the message queue for a session
-   */
   clearQueue(sessionId: string = 'default'): void {
     const queue = this.messageQueueBySession.get(sessionId);
     if (queue && queue.length > 0) {
-      // Reject all pending messages
       for (const item of queue) {
         item.reject(new Error('Queue cleared'));
       }
-      // Delete the key entirely to prevent memory leak from accumulated empty arrays
       this.messageQueueBySession.delete(sessionId);
       console.log(`[AgentManager] Queue cleared for session ${sessionId}`);
     } else if (queue) {
-      // Clean up empty queue entries
       this.messageQueueBySession.delete(sessionId);
     }
   }
 
-  /**
-   * Stop the query for a specific session (or any running query if no sessionId)
-   * Also clears any queued messages for that session
-   */
   stopQuery(sessionId?: string, clearQueuedMessages: boolean = true): boolean {
     if (sessionId) {
-      // Clear the queue first
       if (clearQueuedMessages) {
         this.clearQueue(sessionId);
       }
@@ -738,14 +547,11 @@ class AgentManagerClass extends EventEmitter {
       if (this.processingBySession.get(sessionId) && abortController) {
         console.log(`[AgentManager] Stopping query for session ${sessionId}...`);
         abortController.abort();
-        // Note: Don't emit 'done' here - it would broadcast to ALL sessions.
-        // The frontend handles cleanup on its end when stopping/deleting a session.
         return true;
       }
       return false;
     }
 
-    // Legacy: stop any running query (first one found)
     for (const [sid, isProcessing] of this.processingBySession.entries()) {
       if (isProcessing) {
         if (clearQueuedMessages) {
@@ -762,55 +568,37 @@ class AgentManagerClass extends EventEmitter {
     return false;
   }
 
-  /**
-   * Check if a query is currently processing (optionally for a specific session)
-   */
   isQueryProcessing(sessionId?: string): boolean {
     if (sessionId) {
       return this.processingBySession.get(sessionId) || false;
     }
-    // Check if any session is processing
     for (const isProcessing of this.processingBySession.values()) {
       if (isProcessing) return true;
     }
     return false;
   }
 
-  /**
-   * Get the current workspace directory
-   */
   getWorkspace(): string {
     return this.workspace;
   }
 
-  /**
-   * Get the default project root directory
-   */
   getProjectRoot(): string {
     return this.projectRoot;
   }
 
-  /**
-   * Set the workspace directory for agent file operations.
-   * This takes effect on the next SDK query (cwd option).
-   */
   setWorkspace(path: string): void {
     console.log('[AgentManager] Workspace changed:', this.workspace, '->', path);
     this.workspace = path;
   }
 
-  /**
-   * Reset workspace to default project root
-   */
   resetWorkspace(): void {
     console.log('[AgentManager] Workspace reset to project root:', this.projectRoot);
     this.workspace = this.projectRoot;
   }
 
-  private async buildOptions(factsContext: string, soulContext: string, abortController: AbortController, lastMessageTimestamp?: string, isSimpleQuery?: boolean): Promise<SDKOptions> {
+  private async buildOptions(factsContext: string, soulContext: string, abortController: AbortController, lastMessageTimestamp?: string, isSimple?: boolean): Promise<SDKOptions> {
     const appendParts: string[] = [];
 
-    // Add temporal context first (current time awareness)
     const temporalContext = this.buildTemporalContext(lastMessageTimestamp);
     appendParts.push(temporalContext);
 
@@ -822,7 +610,6 @@ class AgentManagerClass extends EventEmitter {
       appendParts.push(this.identity);
     }
 
-    // Add user profile from settings
     const userProfile = SettingsManager.getFormattedProfile();
     if (userProfile) {
       appendParts.push(userProfile);
@@ -836,75 +623,63 @@ class AgentManagerClass extends EventEmitter {
       appendParts.push(soulContext);
     }
 
-    // Add daily logs context (recent activity journal)
     const dailyLogsContext = this.memory?.getDailyLogsContext(3);
     if (dailyLogsContext) {
       appendParts.push(dailyLogsContext);
     }
 
-    // Add capabilities information
     const capabilities = this.buildCapabilitiesPrompt();
     if (capabilities) {
       appendParts.push(capabilities);
     }
 
-    // Get thinking level and convert to token budget
-    // Simple queries get minimal thinking to reduce latency
     const baseThinkingLevel = SettingsManager.get('agent.thinkingLevel') || 'normal';
-    const effectiveThinkingLevel = isSimpleQuery ? 'minimal' : baseThinkingLevel;
+    const effectiveThinkingLevel = isSimple ? 'minimal' : baseThinkingLevel;
     const thinkingBudget = THINKING_BUDGETS[effectiveThinkingLevel];
 
-    if (isSimpleQuery) {
+    if (isSimple) {
       console.log(`[AgentManager] Using minimal thinking for simple query (${thinkingBudget} tokens)`);
     }
 
     const options: SDKOptions = {
       model: this.model,
-      cwd: this.workspace,  // Use isolated workspace for agent file operations
+      cwd: this.workspace,
       maxTurns: 20,
       ...(thinkingBudget !== undefined && thinkingBudget > 0 && { maxThinkingTokens: thinkingBudget }),
       abortController,
       tools: { type: 'preset', preset: 'claude_code' },
-      settingSources: ['project'],  // Load skills from .claude/skills/
-      canUseTool: buildCanUseToolCallback(),  // Pre-tool-use safety validation
+      settingSources: ['project'],
+      canUseTool: buildCanUseToolCallback(),
       hooks: {
-        PreToolUse: [buildPreToolUseHook()],  // Pre-tool-use safety hook
+        PreToolUse: [buildPreToolUseHook()],
       },
       allowedTools: [
-        // Built-in SDK tools
         'Read', 'Write', 'Edit', 'Bash', 'Glob', 'Grep', 'WebSearch', 'WebFetch',
-        'Skill',  // Enable skills from .claude/skills/
-        // Custom MCP tools - browser & system
+        'Skill',
         'mcp__pocket-agent__browser',
         'mcp__pocket-agent__notify',
-        // Custom MCP tools - memory
         'mcp__pocket-agent__remember',
         'mcp__pocket-agent__forget',
         'mcp__pocket-agent__list_facts',
         'mcp__pocket-agent__memory_search',
         'mcp__pocket-agent__daily_log',
-        // Custom MCP tools - soul
         'mcp__pocket-agent__soul_set',
         'mcp__pocket-agent__soul_get',
         'mcp__pocket-agent__soul_list',
         'mcp__pocket-agent__soul_delete',
-        // Custom MCP tools - scheduler
         'mcp__pocket-agent__schedule_task',
         'mcp__pocket-agent__create_reminder',
         'mcp__pocket-agent__list_scheduled_tasks',
         'mcp__pocket-agent__delete_scheduled_task',
-        // Custom MCP tools - calendar
         'mcp__pocket-agent__calendar_add',
         'mcp__pocket-agent__calendar_list',
         'mcp__pocket-agent__calendar_upcoming',
         'mcp__pocket-agent__calendar_delete',
-        // Custom MCP tools - tasks
         'mcp__pocket-agent__task_add',
         'mcp__pocket-agent__task_list',
         'mcp__pocket-agent__task_complete',
         'mcp__pocket-agent__task_delete',
         'mcp__pocket-agent__task_due',
-        // Custom MCP tools - project
         'mcp__pocket-agent__set_project',
         'mcp__pocket-agent__get_project',
         'mcp__pocket-agent__clear_project',
@@ -921,13 +696,9 @@ class AgentManagerClass extends EventEmitter {
     }
 
     if (this.toolsConfig) {
-      // Build child process MCP servers (e.g., computer use)
       const mcpServers = buildMCPServers(this.toolsConfig);
-
-      // Build SDK MCP servers (in-process tools like browser, notify, memory)
       const sdkMcpServers = await buildSdkMcpServers(this.toolsConfig);
 
-      // Merge both types
       const allServers = {
         ...mcpServers,
         ...(sdkMcpServers || {}),
@@ -1055,300 +826,9 @@ notify(title="Reminder", body="Meeting in 5 minutes", urgency="critical")
 - For full desktop automation, user needs to enable Computer Use (Docker-based)`;
   }
 
-  private extractFromMessage(message: unknown, current: string): string {
-    const msg = message as { type?: string; message?: { content?: unknown }; output?: string; result?: string };
-    if (msg.type === 'assistant') {
-      const content = msg.message?.content;
-      if (Array.isArray(content)) {
-        const textBlocks = content
-          .filter((block: unknown) => (block as { type?: string })?.type === 'text')
-          .map((block: unknown) => (block as { text: string }).text);
-        const text = textBlocks.join('\n');
-        // Extract and strip any trailing "User:" suggested prompts
-        const { text: cleanedText, suggestion } = this.extractSuggestedPrompt(text);
-        if (suggestion) {
-          this.lastSuggestedPrompt = suggestion;
-        }
-        return cleanedText;
-      }
-    }
-
-    if (msg.type === 'result') {
-      const result = msg.output || msg.result;
-      if (result) {
-        // Extract and strip any trailing "User:" suggested prompts from result
-        const { text: cleanedText, suggestion } = this.extractSuggestedPrompt(result);
-        if (suggestion) {
-          this.lastSuggestedPrompt = suggestion;
-        }
-        return cleanedText;
-      }
-    }
-
-    return current;
-  }
-
-  /**
-   * Extract and strip trailing suggested user prompts that the SDK might include
-   * These appear as "User: ..." at the end of responses
-   * Returns both the cleaned text and the extracted suggestion
-   */
-  private extractSuggestedPrompt(text: string): { text: string; suggestion?: string } {
-    if (!text) return { text };
-
-    // Pattern: newlines followed by "User:" (case-insensitive) and any text until end
-    const match = text.match(/\n\nuser:\s*(.+)$/is);
-
-    if (match) {
-      const suggestion = match[1].trim();
-      const cleanedText = text.replace(/\n\nuser:[\s\S]*$/is, '').trim();
-
-      // Validate that the suggestion looks like a user prompt, not an assistant question
-      const isValidUserPrompt = this.isValidUserPrompt(suggestion);
-
-      if (isValidUserPrompt) {
-        console.log('[AgentManager] Extracted suggested prompt:', suggestion);
-        return { text: cleanedText, suggestion };
-      } else {
-        console.log('[AgentManager] Rejected invalid suggestion (assistant-style):', suggestion);
-        return { text: cleanedText }; // Strip but don't use as suggestion
-      }
-    }
-
-    return { text: text.trim() };
-  }
-
-  /**
-   * Check if a suggestion looks like a valid user prompt
-   * Rejects questions and assistant-style speech
-   */
-  private isValidUserPrompt(suggestion: string): boolean {
-    if (!suggestion) return false;
-
-    // Reject if it ends with a question mark (assistant asking a question)
-    if (suggestion.endsWith('?')) return false;
-
-    // Reject if it starts with common question/assistant words
-    const assistantPatterns = /^(what|how|would|do|does|is|are|can|could|shall|should|may|might|let me|i can|i'll|i will|here's|here is)/i;
-    if (assistantPatterns.test(suggestion)) return false;
-
-    // Reject if it's too long (likely not a simple user command)
-    if (suggestion.length > 100) return false;
-
-    // Accept short, command-like suggestions
-    return true;
-  }
-
   private emitStatus(status: AgentStatus): void {
     this.emit('status', status);
   }
-
-  // Track active subagents
-  private activeSubagents: Map<string, { type: string; description: string }> = new Map();
-
-  private processStatusFromMessage(message: unknown): void {
-    // Handle tool use from assistant messages
-    const msg = message as { type?: string; subtype?: string; message?: { content?: unknown } };
-    if (msg.type === 'assistant') {
-      const content = msg.message?.content;
-      if (Array.isArray(content)) {
-        for (const block of content) {
-          if (block?.type === 'tool_use') {
-            const rawName = block.name as string;
-            const toolName = this.formatToolName(rawName);
-            const toolInput = this.formatToolInput(block.input);
-
-            // Track tool usage for empty response handling
-            this.toolsUsedInQuery.push(rawName);
-
-            // Check if this is a Task (subagent) tool
-            if (rawName === 'Task') {
-              const input = block.input as { subagent_type?: string; description?: string; prompt?: string };
-              const agentId = `agent-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
-              const agentType = input.subagent_type || 'general';
-              const description = input.description || input.prompt?.slice(0, 50) || 'working on it';
-
-              this.activeSubagents.set(agentId, { type: agentType, description });
-
-              this.emitStatus({
-                type: 'subagent_start',
-                agentId,
-                agentType,
-                toolInput: description,
-                agentCount: this.activeSubagents.size,
-                message: this.getSubagentMessage(agentType),
-              });
-            } else {
-              this.emitStatus({
-                type: 'tool_start',
-                toolName,
-                toolInput,
-                message: `batting at ${toolName}...`,
-              });
-            }
-          }
-        }
-      }
-    }
-
-    // Handle tool results
-    if (msg.type === 'user' && msg.message?.content) {
-      const content = msg.message.content;
-      if (Array.isArray(content)) {
-        for (const block of content) {
-          if (block?.type === 'tool_result') {
-            // Check if any subagents completed
-            if (this.activeSubagents.size > 0) {
-              // Remove one subagent (we don't have exact ID matching, so remove oldest)
-              const firstKey = this.activeSubagents.keys().next().value;
-              if (firstKey) {
-                this.activeSubagents.delete(firstKey);
-              }
-
-              if (this.activeSubagents.size > 0) {
-                // Still have active subagents
-                this.emitStatus({
-                  type: 'subagent_update',
-                  agentCount: this.activeSubagents.size,
-                  message: `${this.activeSubagents.size} kitty${this.activeSubagents.size > 1 ? 'ies' : ''} still hunting`,
-                });
-              } else {
-                this.emitStatus({
-                  type: 'subagent_end',
-                  agentCount: 0,
-                  message: 'squad done! cleaning up...',
-                });
-              }
-            } else {
-              this.emitStatus({
-                type: 'tool_end',
-                message: 'caught it! processing...',
-              });
-            }
-          }
-        }
-      }
-    }
-
-    // Handle system messages
-    if (msg.type === 'system') {
-      if (msg.subtype === 'init') {
-        this.emitStatus({ type: 'thinking', message: 'waking up from a nap...' });
-      }
-    }
-  }
-
-  private getSubagentMessage(agentType: string): string {
-    const messages: Record<string, string> = {
-      'Explore': 'sent a curious kitten to explore',
-      'Plan': 'calling in the architect cat',
-      'Bash': 'summoning a terminal tabby',
-      'general-purpose': 'summoning a helper kitty',
-    };
-    return messages[agentType] || `summoning ${agentType} cat friend`;
-  }
-
-  private formatToolName(name: string): string {
-    // Fun, cat-themed tool names that match PA's vibe
-    const friendlyNames: Record<string, string> = {
-      // SDK built-in tools
-      Read: 'sniffing this file',
-      Write: 'scratching notes down',
-      Edit: 'pawing at some code',
-      Bash: 'hacking at the terminal',
-      Glob: 'hunting for files',
-      Grep: 'digging through code',
-      WebSearch: 'prowling the web',
-      WebFetch: 'fetching that page',
-      Task: 'summoning a helper kitty',
-      NotebookEdit: 'editing notebook',
-
-      // Memory tools
-      remember: 'stashing in my cat brain',
-      forget: 'knocking it off the shelf',
-      list_facts: 'checking my memories',
-      memory_search: 'sniffing through archives',
-
-      // Browser tool
-      browser: 'pouncing on browser',
-
-      // Computer use tool
-      computer: 'walking on the keyboard',
-
-      // Scheduler tools
-      schedule_task: 'setting an alarm meow',
-      list_scheduled_tasks: 'checking the schedule',
-      delete_scheduled_task: 'knocking that off',
-
-      // macOS tools
-      notify: 'sending a meow',
-
-      // Task tools
-      task_add: 'adding to the hunt list',
-      task_list: 'checking your tasks',
-      task_complete: 'caught it!',
-      task_delete: 'batting that away',
-      task_due: 'sniffing what\'s due',
-
-      // Calendar tools
-      calendar_add: 'marking territory',
-      calendar_list: 'checking the calendar',
-      calendar_upcoming: 'seeing what\'s coming up',
-      calendar_delete: 'scratching that out',
-    };
-    return friendlyNames[name] || name;
-  }
-
-  private formatToolInput(input: unknown): string {
-    if (!input) return '';
-    // Extract meaningful info from tool input
-    if (typeof input === 'string') return input.slice(0, 100);
-    const inp = input as Record<string, string | number[] | undefined>;
-
-    // File operations
-    if (inp.file_path) return inp.file_path as string;
-    if (inp.notebook_path) return inp.notebook_path as string;
-
-    // Search/patterns
-    if (inp.pattern) return inp.pattern as string;
-    if (inp.query) return inp.query as string;
-
-    // Commands
-    if (inp.command) return (inp.command as string).slice(0, 80);
-
-    // Web
-    if (inp.url) return inp.url as string;
-
-    // Agent/Task
-    if (inp.prompt) return (inp.prompt as string).slice(0, 80);
-    if (inp.description) return (inp.description as string).slice(0, 80);
-
-    // Memory tools
-    if (inp.category && inp.subject) return `${inp.category}/${inp.subject}`;
-    if (inp.content) return (inp.content as string).slice(0, 80);
-
-    // Browser tool
-    if (inp.action) {
-      const browserActions: Record<string, string> = {
-        navigate: inp.url ? `→ ${inp.url}` : 'navigating',
-        screenshot: 'capturing screen',
-        click: inp.selector ? `clicking ${inp.selector}` : 'clicking',
-        type: inp.text ? `typing "${(inp.text as string).slice(0, 30)}"` : 'typing',
-        evaluate: 'running script',
-        extract: (inp.extract_type as string) || 'extracting data',
-      };
-      return browserActions[inp.action as string] || (inp.action as string);
-    }
-
-    // Computer use
-    if (inp.coordinate && Array.isArray(inp.coordinate) && inp.coordinate.length >= 2) {
-      return `at (${inp.coordinate[0]}, ${inp.coordinate[1]})`;
-    }
-    if (inp.text) return `"${(inp.text as string).slice(0, 40)}"`;
-
-    return '';
-  }
-
 
   private async createSummary(messages: Message[]): Promise<string> {
     if (messages.length === 0) {
@@ -1377,7 +857,7 @@ notify(title="Reminder", body="Meeting in 5 minutes", urgency="critical")
       let summary = '';
 
       for await (const message of queryResult) {
-        summary = this.extractFromMessage(message, summary);
+        summary = extractTextFromMessage(message, summary);
       }
 
       console.log(`[AgentManager] Created summary of ${messages.length} messages`);
@@ -1395,35 +875,22 @@ notify(title="Reminder", body="Meeting in 5 minutes", urgency="critical")
     }
   }
 
-  /**
-   * Parse database timestamp
-   * If user has timezone configured, treat DB timestamps as UTC
-   * Otherwise, use system local time (original behavior)
-   */
   private parseDbTimestamp(timestamp: string): Date {
-    // If already has timezone indicator, parse directly
     if (/Z$|[+-]\d{2}:?\d{2}$/.test(timestamp)) {
       return new Date(timestamp);
     }
 
-    // Check if user has configured a timezone
     const userTimezone = SettingsManager.get('profile.timezone');
 
     if (userTimezone) {
-      // User has timezone set - treat DB timestamps as UTC
       const normalized = timestamp.replace(' ', 'T');
       return new Date(normalized + 'Z');
     } else {
-      // No timezone configured - use system local time
       const normalized = timestamp.replace(' ', 'T');
       return new Date(normalized);
     }
   }
 
-  /**
-   * Format a message timestamp for display in conversation context
-   * Shows relative time for recent messages, date for older ones
-   */
   private formatMessageTimestamp(timestamp: string): string {
     try {
       const date = this.parseDbTimestamp(timestamp);
@@ -1433,23 +900,17 @@ notify(title="Reminder", body="Meeting in 5 minutes", urgency="critical")
       const diffHours = Math.floor(diffMs / 3600000);
       const diffDays = Math.floor(diffMs / 86400000);
 
-      // Very recent: show relative time
       if (diffMins < 1) return 'just now';
       if (diffMins < 60) return `${diffMins}m ago`;
       if (diffHours < 24) return `${diffHours}h ago`;
       if (diffDays < 7) return `${diffDays}d ago`;
 
-      // Older: show date
       return date.toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
     } catch {
       return '';
     }
   }
 
-  /**
-   * Build temporal context for the system prompt
-   * Gives the agent awareness of current time and conversation timing
-   */
   private buildTemporalContext(lastMessageTimestamp?: string): string {
     const now = new Date();
     const dayNames = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];
@@ -1472,7 +933,6 @@ notify(title="Reminder", body="Meeting in 5 minutes", urgency="critical")
       `It is ${dayName}, ${dateStr} at ${timeStr}.`,
     ];
 
-    // Add time since last message if available
     if (lastMessageTimestamp) {
       try {
         const lastDate = this.parseDbTimestamp(lastMessageTimestamp);
@@ -1495,6 +955,44 @@ notify(title="Reminder", body="Meeting in 5 minutes", urgency="critical")
     }
 
     return lines.join('\n');
+  }
+
+  private categorizeError(errorMsg: string): 'api' | 'timeout' | 'rate_limit' | 'auth' | 'network' | 'unknown' {
+    const lowerMsg = errorMsg.toLowerCase();
+
+    if (lowerMsg.includes('rate limit') || lowerMsg.includes('429') || lowerMsg.includes('too many requests')) {
+      return 'rate_limit';
+    }
+    if (lowerMsg.includes('timeout') || lowerMsg.includes('timed out') || lowerMsg.includes('deadline exceeded')) {
+      return 'timeout';
+    }
+    if (lowerMsg.includes('unauthorized') || lowerMsg.includes('401') || lowerMsg.includes('invalid api key') || lowerMsg.includes('authentication')) {
+      return 'auth';
+    }
+    if (lowerMsg.includes('network') || lowerMsg.includes('econnrefused') || lowerMsg.includes('enotfound') || lowerMsg.includes('fetch failed') || lowerMsg.includes('connection')) {
+      return 'network';
+    }
+    if (lowerMsg.includes('api') || lowerMsg.includes('500') || lowerMsg.includes('502') || lowerMsg.includes('503') || lowerMsg.includes('overloaded')) {
+      return 'api';
+    }
+    return 'unknown';
+  }
+
+  private getFriendlyErrorMessage(errorType: string, originalMsg: string): string {
+    switch (errorType) {
+      case 'rate_limit':
+        return 'Slow down there, tiger! API rate limit hit. Try again in a moment.';
+      case 'timeout':
+        return 'That took too long and timed out. Try a simpler request?';
+      case 'auth':
+        return 'Authentication failed. Check your API key in settings.';
+      case 'network':
+        return 'Network hiccup! Check your internet connection.';
+      case 'api':
+        return 'The API is having issues right now. Try again shortly.';
+      default:
+        return originalMsg.length > 100 ? originalMsg.slice(0, 100) + '...' : originalMsg;
+    }
   }
 
   private extractAndStoreFacts(userMessage: string): void {
