@@ -110,7 +110,7 @@ function getSmartContextOptions(currentQuery?: string): SmartContextOptions {
 
 // Status event types
 export type AgentStatus = {
-  type: 'thinking' | 'tool_start' | 'tool_end' | 'tool_blocked' | 'responding' | 'done' | 'subagent_start' | 'subagent_update' | 'subagent_end' | 'queued' | 'queue_processing';
+  type: 'thinking' | 'tool_start' | 'tool_end' | 'tool_blocked' | 'responding' | 'done' | 'subagent_start' | 'subagent_update' | 'subagent_end' | 'queued' | 'queue_processing' | 'text_delta';
   toolName?: string;
   toolInput?: string;
   message?: string;
@@ -123,6 +123,9 @@ export type AgentStatus = {
   queuedMessage?: string;
   // Safety blocking
   blockedReason?: string;
+  // Streaming text
+  textDelta?: string;
+  isFirstChunk?: boolean;
 };
 
 // SDK types (loaded dynamically)
@@ -196,16 +199,50 @@ interface SDKUserMessage {
 
 // Dynamic SDK loader - prompt can be string or async iterable of messages
 let sdkQuery: ((params: { prompt: string | AsyncIterable<SDKUserMessage>; options?: SDKOptions }) => SDKQuery) | null = null;
+let sdkLoadPromise: Promise<typeof sdkQuery> | null = null;
 
 // Use Function to preserve native import() - TypeScript converts import() to require() in CommonJS
 const dynamicImport = new Function('specifier', 'return import(specifier)') as (specifier: string) => Promise<unknown>;
 
 async function loadSDK(): Promise<typeof sdkQuery> {
   if (!sdkQuery) {
-    const sdk = await dynamicImport('@anthropic-ai/claude-agent-sdk') as { query: typeof sdkQuery };
-    sdkQuery = sdk.query;
+    if (!sdkLoadPromise) {
+      sdkLoadPromise = (async () => {
+        const sdk = await dynamicImport('@anthropic-ai/claude-agent-sdk') as { query: typeof sdkQuery };
+        sdkQuery = sdk.query;
+        return sdkQuery;
+      })();
+    }
+    await sdkLoadPromise;
   }
   return sdkQuery;
+}
+
+/**
+ * Pre-warm the SDK by loading it in the background.
+ * Call this at app startup to reduce first-query latency.
+ */
+export function prewarmSDK(): void {
+  loadSDK().catch(err => console.error('[AgentManager] SDK prewarm failed:', err));
+}
+
+/**
+ * Check if a query is "simple" (casual chat, short questions).
+ * Simple queries skip expensive semantic search and use less thinking.
+ */
+function isSimpleQuery(message: string): boolean {
+  // Very short messages are simple
+  if (message.length < 30) return true;
+
+  // Greetings and casual phrases
+  const casualPatterns = /^(hi|hey|hello|yo|sup|thanks|ok|okay|yes|no|sure|got it|cool|nice|great|good|yep|nope|k|ty|thx)\b/i;
+  if (casualPatterns.test(message.trim())) return true;
+
+  // Single words or very few words (less than 4)
+  const wordCount = message.trim().split(/\s+/).length;
+  if (wordCount <= 3) return true;
+
+  return false;
 }
 
 export interface AgentConfig {
@@ -240,6 +277,8 @@ class AgentManagerClass extends EventEmitter {
   private processingBySession: Map<string, boolean> = new Map();
   private lastSuggestedPrompt: string | undefined = undefined;
   private messageQueueBySession: Map<string, Array<{ message: string; channel: string; images?: ImageContent[]; attachmentInfo?: AttachmentInfo; resolve: (result: ProcessResult) => void; reject: (error: Error) => void }>> = new Map();
+  // Track tools used during current query for better empty response handling
+  private toolsUsedInQuery: string[] = [];
 
   private constructor() {
     super();
@@ -293,6 +332,10 @@ class AgentManagerClass extends EventEmitter {
     this.backfillMessageEmbeddings().catch(e => {
       console.error('[AgentManager] Embedding backfill failed:', e);
     });
+
+    // Pre-warm SDK to reduce first-query latency
+    console.log('[AgentManager] Pre-warming SDK...');
+    prewarmSDK();
   }
 
   /**
@@ -414,15 +457,25 @@ class AgentManagerClass extends EventEmitter {
     const abortController = new AbortController();
     this.abortControllersBySession.set(sessionId, abortController);
     this.lastSuggestedPrompt = undefined;
+    this.toolsUsedInQuery = [];  // Reset tool tracking for new query
     let wasCompacted = false;
+
+    // Timing instrumentation
+    const queryStartTime = Date.now();
+    const isSimple = isSimpleQuery(userMessage);
+    console.log(`[AgentManager] Query type: ${isSimple ? 'SIMPLE' : 'complex'} (${userMessage.length} chars)`);
+    console.time('[AgentManager] Total query time');
 
     // Set session context for MCP tools to use
     setCurrentSessionId(sessionId);
 
     try {
+      console.time('[AgentManager] Context building');
       // Use smart context: recent messages + rolling summary + semantic retrieval
-      const smartContextOptions = getSmartContextOptions(userMessage);
+      // Skip semantic search for simple queries to reduce latency
+      const smartContextOptions = getSmartContextOptions(isSimple ? undefined : userMessage);
       const smartContext = await memory.getSmartContext(sessionId, smartContextOptions);
+      console.timeEnd('[AgentManager] Context building');
       const factsContext = memory.getFactsForContext();
       const soulContext = memory.getSoulContext();
 
@@ -472,7 +525,9 @@ class AgentManagerClass extends EventEmitter {
         ? userMessages[userMessages.length - 1].timestamp
         : undefined;
 
-      const options = await this.buildOptions(factsContext, soulContext, abortController, lastUserMessageTimestamp);
+      console.time('[AgentManager] Build options');
+      const options = await this.buildOptions(factsContext, soulContext, abortController, lastUserMessageTimestamp, isSimple);
+      console.timeEnd('[AgentManager] Build options');
 
       // Configure provider environment based on model (sets ANTHROPIC_BASE_URL, AUTH_TOKEN, etc.)
       configureProviderEnvironment(this.model);
@@ -480,6 +535,7 @@ class AgentManagerClass extends EventEmitter {
       // Build prompt - use async generator for images, string for text-only
       let queryResult;
       console.log('[AgentManager] Calling query() with model:', options.model, 'thinking:', options.maxThinkingTokens || 'default');
+      console.time('[AgentManager] SDK query');
       this.emitStatus({ type: 'thinking', message: '*stretches paws* thinking...' });
 
       if (images && images.length > 0) {
@@ -514,6 +570,7 @@ class AgentManagerClass extends EventEmitter {
         queryResult = query({ prompt: fullPromptText, options });
       }
       let response = '';
+      let isFirstTextChunk = true;
 
       for await (const message of queryResult) {
         // Check if aborted
@@ -522,35 +579,35 @@ class AgentManagerClass extends EventEmitter {
           throw new Error('Query stopped by user');
         }
         this.processStatusFromMessage(message);
+        const prevLength = response.length;
         response = this.extractFromMessage(message, response);
+
+        // Emit text delta if response grew (streaming)
+        if (response.length > prevLength) {
+          const delta = response.slice(prevLength);
+          this.emitStatus({
+            type: 'text_delta',
+            textDelta: delta,
+            isFirstChunk: isFirstTextChunk,
+          });
+          isFirstTextChunk = false;
+        }
       }
+      console.timeEnd('[AgentManager] SDK query');
 
       this.emitStatus({ type: 'done' });
 
-      // If no text response, make a follow-up call to get one
+      // If no text response, build informative fallback based on what tools were used
       if (!response) {
-        console.log('[AgentManager] No text response, requesting summary...');
-        this.emitStatus({ type: 'thinking', message: 'summarizing...' });
-
-        const summaryResult = query({
-          prompt: 'Briefly summarize what you just did in 1-2 sentences.',
-          options: {
-            ...options,
-            maxThinkingTokens: undefined, // No extended thinking for summary
-          },
-        });
-
-        for await (const message of summaryResult) {
-          if (abortController.signal.aborted) break;
-          response = this.extractFromMessage(message, response);
+        if (this.toolsUsedInQuery.length > 0) {
+          const toolsSummary = this.toolsUsedInQuery.slice(0, 5).join(', ');
+          const moreCount = this.toolsUsedInQuery.length > 5 ? ` (+${this.toolsUsedInQuery.length - 5} more)` : '';
+          console.log(`[AgentManager] Empty response after tools: ${toolsSummary}${moreCount}`);
+          response = `done! used: ${toolsSummary}${moreCount}`;
+        } else {
+          console.log('[AgentManager] Empty response with no tools - possible glitch');
+          response = "hmm, i got confused there. could you rephrase that?";
         }
-
-        // Final fallback if summary also fails
-        if (!response) {
-          response = 'Done.';
-        }
-
-        this.emitStatus({ type: 'done' });
       }
 
       // Skip saving HEARTBEAT_OK responses from scheduled jobs to memory/chat
@@ -624,6 +681,9 @@ class AgentManagerClass extends EventEmitter {
 
       throw error;
     } finally {
+      console.timeEnd('[AgentManager] Total query time');
+      const totalMs = Date.now() - queryStartTime;
+      console.log(`[AgentManager] Query completed in ${totalMs}ms`);
       this.processingBySession.set(sessionId, false);
       this.abortControllersBySession.delete(sessionId);
 
@@ -747,7 +807,7 @@ class AgentManagerClass extends EventEmitter {
     this.workspace = this.projectRoot;
   }
 
-  private async buildOptions(factsContext: string, soulContext: string, abortController: AbortController, lastMessageTimestamp?: string): Promise<SDKOptions> {
+  private async buildOptions(factsContext: string, soulContext: string, abortController: AbortController, lastMessageTimestamp?: string, isSimpleQuery?: boolean): Promise<SDKOptions> {
     const appendParts: string[] = [];
 
     // Add temporal context first (current time awareness)
@@ -789,8 +849,14 @@ class AgentManagerClass extends EventEmitter {
     }
 
     // Get thinking level and convert to token budget
-    const thinkingLevel = SettingsManager.get('agent.thinkingLevel') || 'normal';
-    const thinkingBudget = THINKING_BUDGETS[thinkingLevel];
+    // Simple queries get minimal thinking to reduce latency
+    const baseThinkingLevel = SettingsManager.get('agent.thinkingLevel') || 'normal';
+    const effectiveThinkingLevel = isSimpleQuery ? 'minimal' : baseThinkingLevel;
+    const thinkingBudget = THINKING_BUDGETS[effectiveThinkingLevel];
+
+    if (isSimpleQuery) {
+      console.log(`[AgentManager] Using minimal thinking for simple query (${thinkingBudget} tokens)`);
+    }
 
     const options: SDKOptions = {
       model: this.model,
@@ -1091,6 +1157,9 @@ notify(title="Reminder", body="Meeting in 5 minutes", urgency="critical")
             const rawName = block.name as string;
             const toolName = this.formatToolName(rawName);
             const toolInput = this.formatToolInput(block.input);
+
+            // Track tool usage for empty response handling
+            this.toolsUsedInQuery.push(rawName);
 
             // Check if this is a Task (subagent) tool
             if (rawName === 'Task') {
