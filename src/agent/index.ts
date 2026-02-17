@@ -10,6 +10,7 @@ import os from 'os';
 import path from 'path';
 import { buildCanUseToolCallback, buildPreToolUseHook, setStatusEmitter } from './safety';
 import { PersistentSDKSession, TurnResult } from './persistent-session';
+import { createGearState, selectGear, GEAR_MODELS, GearState } from './complexity';
 
 // Provider configuration for different LLM backends
 type ProviderType = 'anthropic' | 'moonshot' | 'glm';
@@ -384,6 +385,7 @@ export interface ProcessResult {
   contextTokens?: number;
   contextWindow?: number;
   media?: MediaAttachment[];
+  modelUsed?: string;
 }
 
 /**
@@ -405,6 +407,8 @@ class AgentManagerClass extends EventEmitter {
   private messageQueueBySession: Map<string, Array<{ message: string; channel: string; images?: ImageContent[]; attachmentInfo?: AttachmentInfo; resolve: (result: ProcessResult) => void; reject: (error: Error) => void }>> = new Map();
   private sdkSessionIdBySession: Map<string, string> = new Map();
   private persistentSessions: Map<string, PersistentSDKSession> = new Map();
+  private gearStateBySession: Map<string, GearState> = new Map();
+  private lastToolsUsedBySession: Map<string, boolean> = new Map();
   private contextUsageBySession: Map<string, { contextTokens: number; contextWindow: number }> = new Map();
   private pendingMedia: MediaAttachment[] = [];
 
@@ -610,6 +614,26 @@ class AgentManagerClass extends EventEmitter {
     this.lastSuggestedPromptBySession.set(sessionId, undefined);
     this.pendingMedia = [];
 
+    // Gear system: select model based on conversation momentum
+    const prevGearState = this.gearStateBySession.get(sessionId) || createGearState();
+    const lastToolsUsed = this.lastToolsUsedBySession.get(sessionId) || false;
+    const newGearState = selectGear(userMessage, prevGearState, lastToolsUsed);
+    this.gearStateBySession.set(sessionId, newGearState);
+
+    // Resolved model = min(gear model, user ceiling)
+    const gearModel = GEAR_MODELS[newGearState.level];
+    const modelHierarchy = [
+      'claude-haiku-4-5-20251001',
+      'claude-sonnet-4-5-20250929',
+      'claude-opus-4-6',
+    ];
+    const ceilingIndex = modelHierarchy.indexOf(this.model);
+    const gearIndex = modelHierarchy.indexOf(gearModel);
+    const effectiveModel = ceilingIndex >= 0 && gearIndex > ceilingIndex ? this.model : gearModel;
+    const gearLabel = `G${newGearState.level}`;
+    const modelShort = effectiveModel.includes('haiku') ? 'haiku' : effectiveModel.includes('sonnet') ? 'sonnet' : 'opus';
+    console.log(`[AgentManager] Gear: ${gearLabel} (${modelShort}) | downshift: ${newGearState.downshiftCounter}/${3} | ceiling: ${this.model}`);
+
     try {
       const existingSession = this.persistentSessions.get(sessionId);
       let turnResult: TurnResult;
@@ -657,7 +681,7 @@ class AgentManagerClass extends EventEmitter {
         if (!queryFn) throw new Error('Failed to load SDK');
 
         // Build options with dynamic context
-        const options = await this.buildPersistentOptions(memory, sessionId, sdkSessionId);
+        const options = await this.buildPersistentOptions(memory, sessionId, sdkSessionId, effectiveModel, newGearState.level);
 
         console.log('[AgentManager] Calling query() with model:', options.model, 'thinking:', JSON.stringify(options.thinking) || 'default', 'effort:', options.effort || 'default');
         this.emitStatus({ type: 'thinking', sessionId, message: '*stretches paws* thinking...' });
@@ -723,7 +747,7 @@ class AgentManagerClass extends EventEmitter {
             this.persistentSessions.delete(sessionId);
 
             // Create new session without resume
-            const freshOptions = await this.buildPersistentOptions(memory, sessionId, undefined);
+            const freshOptions = await this.buildPersistentOptions(memory, sessionId, undefined, effectiveModel, newGearState.level);
             const freshSession = new PersistentSDKSession(
               sessionId,
               (msg) => this.processStatusFromMessage(msg),
@@ -798,7 +822,7 @@ class AgentManagerClass extends EventEmitter {
         if (!queryFn) throw new Error('Failed to load SDK');
 
         const resumeId = isAuthFailed ? staleId : undefined;
-        const freshOptions = await this.buildPersistentOptions(memory, sessionId, resumeId);
+        const freshOptions = await this.buildPersistentOptions(memory, sessionId, resumeId, effectiveModel, newGearState.level);
         const freshSession = new PersistentSDKSession(
           sessionId,
           (msg) => this.processStatusFromMessage(msg),
@@ -958,6 +982,7 @@ class AgentManagerClass extends EventEmitter {
         contextTokens: contextUsage?.contextTokens,
         contextWindow: contextUsage?.contextWindow,
         media: this.pendingMedia.length > 0 ? this.pendingMedia : undefined,
+        modelUsed: effectiveModel,
       };
     } catch (error) {
       const errorMsg = error instanceof Error ? error.message : 'Unknown error';
@@ -1165,7 +1190,7 @@ class AgentManagerClass extends EventEmitter {
    * Dynamic context (temporal, facts, soul, daily logs) is injected per-message via
    * the UserPromptSubmit hook's additionalContext, so it's fresh for each turn.
    */
-  private async buildPersistentOptions(memory: MemoryManager, sessionId: string, sdkSessionId?: string): Promise<SDKOptions> {
+  private async buildPersistentOptions(memory: MemoryManager, sessionId: string, sdkSessionId?: string, resolvedModel?: string, gearLevel?: 1 | 2 | 3): Promise<SDKOptions> {
     // === Static context (set once at session creation) ===
     const staticParts: string[] = [];
 
@@ -1189,16 +1214,25 @@ class AgentManagerClass extends EventEmitter {
       staticParts.push(capabilities);
     }
 
-    // Get thinking level config — only Anthropic models support thinking/effort.
-    // Non-Anthropic providers (Kimi, GLM) use Anthropic-compatible APIs but may not
-    // handle thinking parameters correctly, causing all output to go to thinking blocks.
-    const provider = getProviderForModel(this.model);
-    const thinkingLevel = SettingsManager.get('agent.thinkingLevel') || 'normal';
-    const thinkingEntry = THINKING_CONFIGS[thinkingLevel] || THINKING_CONFIGS['normal'];
+    // Get thinking level config — gear-aware.
+    // Lower gears use minimal thinking to reduce cost.
+    const effectiveModel = resolvedModel || this.model;
+    const provider = getProviderForModel(effectiveModel);
+    const baseThinkingLevel = SettingsManager.get('agent.thinkingLevel') || 'normal';
+    let effectiveThinkingLevel: string;
+    if (gearLevel === 1 || gearLevel === 2) {
+      effectiveThinkingLevel = 'minimal';
+    } else {
+      effectiveThinkingLevel = baseThinkingLevel;
+    }
+    if (effectiveThinkingLevel !== baseThinkingLevel) {
+      console.log(`[AgentManager] Thinking adjusted to '${effectiveThinkingLevel}' for gear ${gearLevel}`);
+    }
+    const thinkingEntry = THINKING_CONFIGS[effectiveThinkingLevel] || THINKING_CONFIGS['normal'];
     const isAnthropicModel = provider === 'anthropic';
 
     // Configure provider environment and capture env vars
-    await configureProviderEnvironment(this.model);
+    await configureProviderEnvironment(effectiveModel);
     const env: Record<string, string | undefined> = {
       ...process.env,
       CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS: '1',
@@ -1206,7 +1240,7 @@ class AgentManagerClass extends EventEmitter {
     delete env.CLAUDE_CONFIG_DIR;
 
     const options: SDKOptions = {
-      model: this.model,
+      model: effectiveModel,
       cwd: this.workspace,
       maxTurns: 100,
       ...(isAnthropicModel && { thinking: thinkingEntry.thinking }),
