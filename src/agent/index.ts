@@ -176,7 +176,7 @@ function formatAgentError(error: string): string {
   if (e.includes('max_output_tokens') || e.includes('max tokens') || e.includes('output limit')) {
     return 'Response exceeded maximum token limit. Try a simpler request. [max_output_tokens]';
   }
-  if (e.includes('context') && (e.includes('too long') || e.includes('exceed') || e.includes('limit'))) {
+  if ((e.includes('context') || e.includes('prompt')) && (e.includes('too long') || e.includes('exceed') || e.includes('limit'))) {
     return 'Message too long for model context window. Try a shorter message or start a new session. [context_overflow]';
   }
   if (e.includes('model') && (e.includes('not found') || e.includes('not available') || e.includes('does not exist') || e.includes('not support'))) {
@@ -659,6 +659,7 @@ class AgentManagerClass extends EventEmitter {
           : undefined;
 
         turnResult = await existingSession.send(userMessage, contentBlocks);
+        // Debug: log turn result for diagnosis
       } else {
         // === New session: create Query with first message ===
         // Clean up dead session if present
@@ -793,12 +794,18 @@ class AgentManagerClass extends EventEmitter {
       // OAuth token expired mid-session — the subprocess can't refresh it, so we must
       // kill the session, refresh the token, and retry with a new subprocess.
       const isAuthFailed = turnResult.errors?.some(e => e.includes('authentication_failed'));
-      if (isStaleSession || isInvalidThinking || isUnknownResumeError || isSessionCrash || isAuthFailed) {
+      // Prompt/context too long — resumed session exceeded context window, retry fresh
+      const isPromptTooLong = turnResult.errors?.some(e => {
+        const el = e.toLowerCase();
+        return (el.includes('prompt') || el.includes('context')) && (el.includes('too long') || el.includes('exceed') || el.includes('limit'));
+      });
+      if (isStaleSession || isInvalidThinking || isUnknownResumeError || isSessionCrash || isAuthFailed || isPromptTooLong) {
         const staleId = this.sdkSessionIdBySession.get(sessionId);
         const reason = isStaleSession ? 'stale SDK session'
           : isInvalidThinking ? 'invalid thinking signature'
           : isUnknownResumeError ? 'unknown resume error'
           : isAuthFailed ? 'OAuth token expired'
+          : isPromptTooLong ? 'prompt too long (context overflow)'
           : 'session crash';
         console.warn(`[AgentManager] ${reason} detected (${staleId}), retrying...`);
 
@@ -807,6 +814,10 @@ class AgentManagerClass extends EventEmitter {
         if (!isAuthFailed) {
           this.sdkSessionIdBySession.delete(sessionId);
           memory.clearSdkSessionId(sessionId);
+          // Also delete SDK's persisted session files for context overflow
+          if (isPromptTooLong && staleId) {
+            this.deleteSdkSessionFiles(staleId);
+          }
         }
 
         // Close the dead session (subprocess has stale token or corrupted state)
@@ -862,6 +873,79 @@ class AgentManagerClass extends EventEmitter {
           userMessage,
           freshOptions as unknown as Record<string, unknown>,
           retryContentBlocks
+        );
+      }
+
+      // === Detect "Prompt is too long" returned as response text (not error) ===
+      // The SDK sometimes returns this as the response body rather than an error.
+      // When this happens, clear the SDK session and retry fresh.
+      if (turnResult.response.trim() === 'Prompt is too long') {
+        const staleId = this.sdkSessionIdBySession.get(sessionId);
+        console.warn(`[AgentManager] "Prompt is too long" detected as response text (SDK session: ${staleId}), retrying fresh...`);
+
+        this.sdkSessionIdBySession.delete(sessionId);
+        memory.clearSdkSessionId(sessionId);
+
+        // Also delete the SDK's own persisted session files so it doesn't auto-resume
+        if (staleId) {
+          this.deleteSdkSessionFiles(staleId);
+        }
+
+        const deadSession = this.persistentSessions.get(sessionId);
+        if (deadSession) {
+          deadSession.close();
+          this.persistentSessions.delete(sessionId);
+        }
+
+        const queryFn2 = await loadSDK();
+        if (!queryFn2) throw new Error('Failed to load SDK');
+
+        // Delete ALL SDK session files for this workspace to prevent auto-resume
+        this.deleteAllSdkSessionFiles();
+
+        const freshOptions = await this.buildPersistentOptions(memory, sessionId, undefined, effectiveModel, newGearState.level);
+        // Disable persistSession for this retry to avoid the SDK auto-resuming the bloated session
+        delete (freshOptions as Record<string, unknown>).persistSession;
+        delete (freshOptions as Record<string, unknown>).resume;
+
+        const freshSession = new PersistentSDKSession(
+          sessionId,
+          (msg) => this.processStatusFromMessage(msg),
+          (msg, current) => this.extractFromMessage(msg, current)
+        );
+
+        freshSession.on('sdkSessionId', (capturedId: string) => {
+          this.sdkSessionIdBySession.set(sessionId, capturedId);
+          memory.setSdkSessionId(sessionId, capturedId);
+        });
+
+        freshSession.on('closed', () => {
+          console.log(`[AgentManager] Persistent session closed: ${sessionId}`);
+        });
+
+        this.persistentSessions.set(sessionId, freshSession);
+        this.emitStatus({ type: 'thinking', sessionId, message: 'session too large, starting fresh...' });
+
+        const retryContentBlocks2 = images && images.length > 0
+          ? [
+              { type: 'text' as const, text: userMessage },
+              ...images.map(img => ({
+                type: 'image' as const,
+                source: {
+                  type: 'base64' as const,
+                  media_type: img.mediaType,
+                  data: img.data,
+                },
+              })),
+            ]
+          : undefined;
+
+        turnResult = await freshSession.start(
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          queryFn2 as any,
+          userMessage,
+          freshOptions as unknown as Record<string, unknown>,
+          retryContentBlocks2
         );
       }
 
@@ -992,7 +1076,6 @@ class AgentManagerClass extends EventEmitter {
       }
       // Log full error object for debugging
       console.error('[AgentManager] Full error:', JSON.stringify(error, Object.getOwnPropertyNames(error), 2));
-
       // Save user message and error response so they persist across reloads
       memory.saveMessage('user', userMessage, sessionId);
       memory.saveMessage('assistant', errorMsg, sessionId, { isError: true });
@@ -1173,6 +1256,68 @@ class AgentManagerClass extends EventEmitter {
   /**
    * Close all persistent sessions (e.g., on workspace change or cleanup).
    */
+  /**
+   * Delete ALL SDK session files for this workspace to prevent auto-resume of bloated sessions.
+   */
+  private deleteAllSdkSessionFiles(): void {
+    try {
+      const os = require('os');
+      const cwdSlug = this.workspace.replace(/\//g, '-');
+      const sessionDir = path.join(os.homedir(), '.claude', 'projects', cwdSlug);
+
+      if (!fs.existsSync(sessionDir)) return;
+
+      const entries = fs.readdirSync(sessionDir);
+      for (const entry of entries) {
+        if (entry === 'sessions-index.json' || entry === 'CLAUDE.md') continue;
+        const fullPath = path.join(sessionDir, entry);
+        const stat = fs.statSync(fullPath);
+        if (entry.endsWith('.jsonl') || stat.isDirectory()) {
+          if (stat.isDirectory()) {
+            fs.rmSync(fullPath, { recursive: true });
+          } else {
+            fs.unlinkSync(fullPath);
+          }
+          console.log(`[AgentManager] Deleted SDK session file: ${entry}`);
+        }
+      }
+
+      // Clear the sessions index
+      const indexPath = path.join(sessionDir, 'sessions-index.json');
+      if (fs.existsSync(indexPath)) {
+        fs.writeFileSync(indexPath, JSON.stringify({ version: 1, entries: [], originalPath: this.workspace }));
+        console.log('[AgentManager] Cleared SDK sessions index');
+      }
+    } catch (err) {
+      console.warn('[AgentManager] Failed to delete SDK session files:', err);
+    }
+  }
+
+  /**
+   * Delete the SDK's own persisted session files so it won't auto-resume a bloated session.
+   * The SDK stores sessions at ~/.claude/projects/<cwd-slug>/<session-id>.jsonl
+   */
+  private deleteSdkSessionFiles(sdkSessionId: string): void {
+    try {
+      const os = require('os');
+      const cwdSlug = this.workspace.replace(/\//g, '-');
+      const sessionDir = path.join(os.homedir(), '.claude', 'projects', cwdSlug);
+      const jsonlPath = path.join(sessionDir, `${sdkSessionId}.jsonl`);
+      const dirPath = path.join(sessionDir, sdkSessionId);
+
+      if (fs.existsSync(jsonlPath)) {
+        fs.unlinkSync(jsonlPath);
+        console.log(`[AgentManager] Deleted SDK session transcript: ${jsonlPath}`);
+      }
+      if (fs.existsSync(dirPath) && fs.statSync(dirPath).isDirectory()) {
+        fs.rmSync(dirPath, { recursive: true });
+        console.log(`[AgentManager] Deleted SDK session dir: ${dirPath}`);
+      }
+    } catch (err) {
+      console.warn(`[AgentManager] Failed to delete SDK session files for ${sdkSessionId}:`, err);
+    }
+  }
+
   private closeAllPersistentSessions(): void {
     for (const [sid, session] of this.persistentSessions.entries()) {
       console.log(`[AgentManager] Closing persistent session: ${sid}`);
